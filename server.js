@@ -301,8 +301,20 @@ app.get('/api/portfolio', async (req, res) => {
 const fs = require('fs');
 const path = require('path');
 const PROMPT_DIR = path.join(__dirname, 'prompts');
-const VERDICTS = ['BUY AGGRESSIVELY', 'BUY GRADUALLY', 'HOLD', 'WAIT', 'REDUCE RISK'];
-const STANCE = { 'BUY AGGRESSIVELY': 3, 'BUY GRADUALLY': 2, 'HOLD': 1, 'WAIT': 0, 'REDUCE RISK': 0 };
+const VERDICTS = ['BUY AGGRESSIVELY', 'DEPLOY ON PLAN', 'BUY GRADUALLY', 'WATCH', 'HOLD', 'WAIT', 'REDUCE RISK'];
+const STANCE = { 'BUY AGGRESSIVELY': 6, 'DEPLOY ON PLAN': 5, 'BUY GRADUALLY': 4, 'WATCH': 3, 'HOLD': 2, 'WAIT': 1, 'REDUCE RISK': 0 };
+// The Devil's Advocate may only ever pick from these — it is structurally barred from recommending buying.
+const DEFENSIVE_VERDICTS = ['WATCH', 'HOLD', 'WAIT', 'REDUCE RISK'];
+function coerceDefensive(v) { return DEFENSIVE_VERDICTS.includes(v) ? v : 'WAIT'; }
+// Shared rubric so every seat (and the chair) uses the ladder the same way.
+const VERDICT_GUIDE = '\n\nVERDICT LADDER (use these exact words):\n' +
+  '- DEPLOY ON PLAN: routine — put excess cash to work in underweight core holdings to hit existing targets. This is maintenance, not aggression.\n' +
+  '- BUY GRADUALLY: ease in over several tranches rather than all at once.\n' +
+  '- WATCH: conditions mixed; prepare but wait for a specific trigger.\n' +
+  '- HOLD: do nothing; stay the course.\n' +
+  '- WAIT: deliberately keep cash; a known event or risk justifies patience.\n' +
+  '- REDUCE RISK: trim exposure or raise cash.\n' +
+  '- BUY AGGRESSIVELY: RESERVED for genuine market dislocations only (deep drawdown, VIX spike, extreme fear). Do NOT use it for ordinary rebalancing or deploying idle cash.';
 
 // Built-in fallbacks used only if a prompt file is missing.
 const DEFAULTS = {
@@ -310,10 +322,11 @@ const DEFAULTS = {
   'deep-triggers.md': 'From your role, give a blunt independent read of the portfolio, market, the biggest risk, the best opportunity, and whether to deploy today and where. End with ONE verdict.',
   roles: {
     pm: 'Portfolio Manager. Focus on allocation, deployment of dry powder, hitting target weights, and long-term compounding. Pragmatic, action-oriented.',
-    devil: 'Risk Manager and Devil\u2019s Advocate. Your job is to attack the optimistic case, surface what everyone is ignoring, and protect against permanent loss. Be sceptical and blunt.',
-    macro: 'Macro Analyst. Read the VIX, yields, the yield curve, CPI and the Fed. Judge the regime and whether conditions favour deploying or waiting.',
+    risk: 'Risk Manager. Assess portfolio-specific risk: concentration (single names like NVDA/AIA), diversification, drawdown capacity and position sizing. Constructive but cautious.',
+    macro: 'Macro Analyst. Read the VIX, yields, the yield curve, CPI and the Fed, plus any headlines/catalysts in the packet. Judge the regime and whether conditions favour deploying or waiting.',
     news: 'News / Research Analyst. Weigh the headlines and catalysts in the packet. Separate signal from noise; flag anything that genuinely changes the picture.',
-    synthesiser: 'You are the chair. Judge which argument is strongest given the data — do not average or vote. Make one decisive call.',
+    devil: 'Devil\u2019s Advocate. You exist to STOP a bad decision. Make the strongest possible case AGAINST the majority recommendation every time — never endorse buying. Argue: why hold cash, why valuations (e.g. VOO) may be rich, why inflation could stay sticky, why the opportunity score may be misleading, and the single most likely way the committee is wrong.',
+    synthesiser: 'You are the chair. Judge which argument is strongest given the data — do not average or vote. One seat is a mandated Devil\u2019s Advocate; weigh its case honestly on merit (do not dismiss it), but recognise its stance is structurally bearish. Make one decisive call.',
     idiotGuideStyle: 'Plain, blunt, no jargon. Concrete numeric actions.'
   }
 };
@@ -334,7 +347,7 @@ function loadRoles() {
   if (txt) { try { return Object.assign({}, DEFAULTS.roles, JSON.parse(txt)); } catch (_) {} }
   return DEFAULTS.roles;
 }
-function roleLabel(role) { return { pm: 'portfolio mgr', devil: 'risk / devil\u2019s advocate', macro: 'macro', news: 'news/research' }[role] || role || ''; }
+function roleLabel(role) { return { pm: 'portfolio mgr', risk: 'risk manager', macro: 'macro', news: 'news/research', devil: 'devil\u2019s advocate' }[role] || role || ''; }
 
 function parseJsonLoose(text) {
   if (!text) return null;
@@ -407,9 +420,10 @@ async function callProvider(provider, model, user, system) {
 // Fully config-driven: set COMMITTEE_SEATS (a JSON array) in the environment to add/remove
 // models with NO code change. Seats whose provider has no key are skipped automatically.
 const DEFAULT_SEATS = [
-  { seat: 'Portfolio Manager',           role: 'pm',    provider: 'gemini',     model: 'gemini-2.5-flash' },
-  { seat: 'Risk / Devil\u2019s Advocate', role: 'devil', provider: 'openrouter', model: 'deepseek/deepseek-r1:free' },
-  { seat: 'Macro Analyst',               role: 'macro', provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free' }
+  { seat: 'Portfolio Manager', role: 'pm',    provider: 'gemini',     model: 'gemini-2.5-flash' },
+  { seat: 'Risk Manager',      role: 'risk',  provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free' },
+  { seat: 'Macro Analyst',     role: 'macro', provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free' },
+  { seat: 'Devil\u2019s Advocate', role: 'devil', provider: 'openrouter', model: 'deepseek/deepseek-chat-v3.1:free' }
 ];
 function loadSeats() {
   const env = process.env.COMMITTEE_SEATS;
@@ -433,21 +447,25 @@ app.post('/api/deep-triggers', async (req, res) => {
   const packet = req.body && req.body.packet;
   if (!packet || typeof packet !== 'string') return res.status(400).json({ error: 'missing packet' });
 
-  const SYSTEM = loadPrompt('system-investing.md');
+  const SYSTEM = loadPrompt('system-investing.md') + VERDICT_GUIDE;
   const TASK = loadPrompt('deep-triggers.md');
   const ROLES = loadRoles();
   const seats = loadSeats().filter(s => providerHasKey(s.provider));
 
   // ROUND 1 — independent views. Each seat (a distinct model family) reads the same packet in its own role.
   const r1 = await Promise.allSettled(seats.map(async s => {
-    const mandate = ROLES[s.role] || ROLES[s.seat] || '';
+    const isDevil = s.role === 'devil';
+    const mandate = (ROLES[s.role] || ROLES[s.seat] || '') +
+      (isDevil ? '\n\nYou may ONLY choose a verdict from: WATCH, HOLD, WAIT, REDUCE RISK. You never endorse buying. Make the bear case as strong as it can honestly be.' : '');
     const system = SYSTEM + '\n\nYOUR SEAT: ' + s.seat + '\nYOUR MANDATE: ' + mandate + '\n\n' + TASK + MODEL_ASK;
     const raw = await callProvider(s.provider, s.model, packet, system);
     if (!raw) return null;
     const p = parseJsonLoose(raw) || {};
+    let verdict = coerceVerdict(p.verdict) || coerceVerdict(raw);
+    if (isDevil) verdict = coerceDefensive(verdict);
     return {
-      name: s.seat, seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model,
-      verdict: coerceVerdict(p.verdict) || coerceVerdict(raw),
+      name: s.seat, seat: s.seat, role: roleLabel(s.role), isDevil, provider: s.provider, model: s.model,
+      verdict, independentVerdict: verdict,
       keyArgument: p.keyArgument || '', weakestAssumption: p.weakestAssumption || '',
       risk: p.risk || '', deploy: p.deploy || '',
       text: p.reasoning || (typeof raw === 'string' ? raw.slice(0, 600) : '')
@@ -464,13 +482,15 @@ app.post('/api/deep-triggers', async (req, res) => {
       const isDevil = s.role === 'devil';
       const others = models.filter(o => o.seat !== v.seat).map(o => ({ seat: o.seat, verdict: o.verdict, keyArgument: o.keyArgument, risk: o.risk }));
       const system = SYSTEM + '\n\nYOUR SEAT: ' + v.seat + '\nYOUR MANDATE: ' + (ROLES[s.role] || '') +
-        (isDevil ? '\n\nYou are the DEVIL\u2019S ADVOCATE. Attack the emerging consensus. Name what the others are ignoring. Do not soften.' : '\n\nThe other members have spoken. Challenge the single weakest argument among them, then state your FINAL position — change it only if genuinely persuaded.') +
+        (isDevil ? '\n\nYou are the DEVIL\u2019S ADVOCATE. Attack the emerging consensus. Name what the others are ignoring. Do not soften and do not endorse buying. Verdict must be one of: WATCH, HOLD, WAIT, REDUCE RISK.' : '\n\nThe other members have spoken. Challenge the single weakest argument among them, then state your FINAL position — change it only if genuinely persuaded.') +
         '\n\nOTHER MEMBERS\u2019 VIEWS:\n' + JSON.stringify(others) + '\n\n' + TASK + MODEL_ASK;
       const raw = await callProvider(s.provider, s.model, packet, system);
       if (!raw) return v;
       const p = parseJsonLoose(raw) || {};
+      let verdict = coerceVerdict(p.verdict) || v.verdict;
+      if (isDevil) verdict = coerceDefensive(verdict);
       return Object.assign({}, v, {
-        verdict: coerceVerdict(p.verdict) || v.verdict,
+        verdict,
         keyArgument: p.keyArgument || v.keyArgument,
         weakestAssumption: p.weakestAssumption || v.weakestAssumption,
         risk: p.risk || v.risk, deploy: p.deploy || v.deploy,
@@ -520,7 +540,7 @@ app.post('/api/deep-triggers', async (req, res) => {
   if (sbOn()) {
     sbAppend('committee_runs', [{
       ts: Date.now(), verdict, consensus, recommended: out.ifIHad1000, synth_by: out.synthBy, rounds: DEBATE_ROUNDS,
-      models: models.map(m => ({ seat: m.seat, provider: m.provider, model: m.model, verdict: m.verdict, keyArgument: m.keyArgument, risk: m.risk })),
+      models: models.map(m => ({ seat: m.seat, role: m.role, provider: m.provider, model: m.model, independentVerdict: m.independentVerdict, verdict: m.verdict, keyArgument: m.keyArgument, risk: m.risk })),
       packet
     }]).catch(() => {});
   }
