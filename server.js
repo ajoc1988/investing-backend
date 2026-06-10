@@ -264,11 +264,16 @@ async function mapEtoroPnl(raw) {
   positions.forEach(p => {
     const id = p.instrumentId ?? p.instrumentID;
     if (id == null) return;
-    const invested = n2(p.initialAmountInDollars ?? p.unitsBaseValueDollars ?? p.amount) || 0;
-    const pnl = n2(p.unrealizedPnL ?? p.pnL ?? p.pnl ?? p.netProfit) || 0;
+    const cost = n2(p.initialAmountInDollars ?? p.amount ?? p.unitsBaseValueDollars) || 0;
+    // eToro returns unrealizedPnL as a nested object { pnL, exposureInAccountCurrency, ... }; tolerate a plain number too.
+    const u = p.unrealizedPnL;
+    const uObj = (u && typeof u === 'object') ? u : null;
+    const pnl = n2(uObj ? (uObj.pnL ?? uObj.pnlAssetCurrency) : (u ?? p.pnL ?? p.pnl ?? p.netProfit)) || 0;
+    const exposure = uObj ? n2(uObj.exposureInAccountCurrency ?? uObj.exposureInAssetCurrency) : null;
+    const value = exposure != null ? exposure : (cost + pnl);   // current market value
     const units = n2(p.units) || 0;
     const a = byId[id] || (byId[id] = { value: 0, units: 0, pl: 0 });
-    a.value += invested + pnl; a.units += units; a.pl += pnl;
+    a.value += value; a.units += units; a.pl += pnl;
   });
   const ids = Object.keys(byId);
   let symMap = {};
@@ -284,7 +289,9 @@ async function mapEtoroPnl(raw) {
     };
   }).filter(h => h.valueUsd > 0);
   const cash = n2(cp.credit) || 0;   // 'credit' = funds available for new actions (buying power); bonusCredit excluded
-  return normalisePortfolio({ holdings, availableCashUsd: cash, totalPlUsd: n2(cp.unrealizedPnL), todayPlUsd: null });
+  const cpPnl = cp.unrealizedPnL;
+  const totalPl = (cpPnl && typeof cpPnl === 'object') ? n2(cpPnl.pnL ?? cpPnl.pnlAssetCurrency) : n2(cpPnl);
+  return normalisePortfolio({ holdings, availableCashUsd: cash, totalPlUsd: totalPl, todayPlUsd: null });
 }
 function normalisePortfolio(p) {
   const holdings = (p.holdings || []).map(h => {
