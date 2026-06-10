@@ -440,6 +440,28 @@ function pickSynth(seats) {
 }
 const DEBATE_ROUNDS = Math.max(1, Math.min(2, +process.env.DEBATE_ROUNDS || 2));
 
+// Compact summary of the committee's own recent history, injected into the prompt.
+function memDate(ts) { try { return new Date(ts).toISOString().slice(0, 10); } catch (_) { return '?'; } }
+function buildMemory(runs, journal) {
+  const lines = [];
+  if (Array.isArray(runs) && runs.length) {
+    lines.push('RECENT COMMITTEE VERDICTS (oldest first):');
+    runs.slice(-6).forEach(r => {
+      lines.push(`- ${memDate(r.ts)}: ${r.verdict || '?'} (agreement ${r.consensus != null ? r.consensus + '%' : '?'})${r.recommended ? '; rec: ' + String(r.recommended).slice(0, 90) : ''}`);
+    });
+  }
+  if (Array.isArray(journal) && journal.length) {
+    lines.push('WHAT WAS ADVISED vs WHAT ANDREW ACTUALLY DID:');
+    journal.slice(-6).forEach(j => {
+      lines.push(`- ${memDate(j.ts)}: advised "${String(j.recommended_action || '').slice(0, 70)}" | did "${String(j.actual_action || 'not logged').slice(0, 50)}"${j.outcome ? ` | outcome "${String(j.outcome).slice(0, 50)}"` : ''}`);
+    });
+  }
+  if (!lines.length) return '';
+  lines.unshift('COMMITTEE MEMORY — consider whether you keep making the same call while cash stays high, whether prior advice was acted on, and whether past calls look right in hindsight. The Devil\u2019s Advocate MUST flag stale repetition.');
+  const s = lines.join('\n');
+  return s.length > 1900 ? s.slice(0, 1900) : s;
+}
+
 const MODEL_ASK = '\n\nRespond ONLY with compact JSON, no markdown:\n{"verdict":"<one of: ' + VERDICTS.join(' | ') + '>","keyArgument":"<your single strongest point>","weakestAssumption":"<the weakest assumption in the optimistic case>","risk":"<the biggest risk being ignored>","deploy":"<exact $ split for new cash today, or WAIT FOR <event>>","reasoning":"<2-3 blunt sentences>"}';
 const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","ifIHad1000":"<exact $ split totalling 1000, or WAIT FOR <event>>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
 
@@ -447,10 +469,23 @@ app.post('/api/deep-triggers', async (req, res) => {
   const packet = req.body && req.body.packet;
   if (!packet || typeof packet !== 'string') return res.status(400).json({ error: 'missing packet' });
 
-  const SYSTEM = loadPrompt('system-investing.md') + VERDICT_GUIDE;
   const TASK = loadPrompt('deep-triggers.md');
   const ROLES = loadRoles();
   const seats = loadSeats().filter(s => providerHasKey(s.provider));
+
+  // Committee memory — feed the committee its own recent track record so it can self-critique
+  // (repeating the same call? was advice acted on? did past calls look right?). Best-effort.
+  let MEMORY = '';
+  if (sbOn()) {
+    try {
+      const [runs, journal] = await Promise.all([
+        sbRead('committee_runs', 8).catch(() => []),
+        sbRead('journal', 8).catch(() => [])
+      ]);
+      MEMORY = buildMemory(runs, journal);
+    } catch (_) { /* no memory this run */ }
+  }
+  const SYSTEM = loadPrompt('system-investing.md') + VERDICT_GUIDE + (MEMORY ? '\n\n' + MEMORY : '');
 
   // ROUND 1 — independent views. Each seat (a distinct model family) reads the same packet in its own role.
   const r1 = await Promise.allSettled(seats.map(async s => {
