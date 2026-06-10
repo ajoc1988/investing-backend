@@ -478,15 +478,56 @@ async function callProvider(provider, model, user, system) {
   const fn = PROVIDERS[provider]; if (!fn) return null;
   return fn(user, system, model);
 }
+// One attempt at a single model — never throws. Returns { ok, content, error }.
+async function callSeatModel(provider, model, user, system) {
+  try {
+    const c = await callProvider(provider, model, user, system);
+    if (c) return { ok: true, content: c };
+    return { ok: false, error: providerHasKey(provider) ? 'empty response' : 'no API key' };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e).slice(0, 160) };
+  }
+}
+// Try the seat's primary model (one retry), then its cross-provider fallback. Never throws.
+// Returns { content, modelUsed, providerUsed, usedFallback, error }.
+async function callWithFallback(seat, user, system) {
+  const attempts = [];
+  let r = await callSeatModel(seat.provider, seat.model, user, system);
+  if (!r.ok) r = await callSeatModel(seat.provider, seat.model, user, system); // retry primary once
+  if (r.ok) return { content: r.content, modelUsed: seat.model, providerUsed: seat.provider, usedFallback: false };
+  attempts.push(seat.provider + ' ' + seat.model + ' → ' + r.error);
+  if (seat.fallbackModel) {
+    const fp = seat.fallbackProvider || seat.provider;
+    if (providerHasKey(fp)) {
+      const fr = await callSeatModel(fp, seat.fallbackModel, user, system);
+      if (fr.ok) return { content: fr.content, modelUsed: seat.fallbackModel, providerUsed: fp, usedFallback: true };
+      attempts.push('fallback ' + fp + ' ' + seat.fallbackModel + ' → ' + fr.error);
+    } else {
+      attempts.push('fallback ' + fp + ' → no API key');
+    }
+  }
+  return { content: null, modelUsed: null, providerUsed: null, usedFallback: false, error: attempts.join(' | ') };
+}
+// Short, human-readable failure tag for the seat table.
+function shortReason(r) {
+  if (!r) return 'no response';
+  if (/429|rate.?limit|quota|too many|exhaust/i.test(r)) return 'rate-limited / daily quota';
+  if (/401|403|permission|unauthor|forbidden/i.test(r)) return 'auth / permission';
+  if (/timeout|abort|timed? ?out/i.test(r)) return 'timeout';
+  if (/empty response/i.test(r)) return 'empty reply';
+  if (/no API key/i.test(r)) return 'no API key';
+  if (/5\d\d/.test(r)) return 'provider error (5xx)';
+  return r.slice(0, 70);
+}
 
 // Committee seats — genuine diversity = different model FAMILIES + different roles.
 // Fully config-driven: set COMMITTEE_SEATS (a JSON array) in the environment to add/remove
 // models with NO code change. Seats whose provider has no key are skipped automatically.
 const DEFAULT_SEATS = [
-  { seat: 'Portfolio Manager', role: 'pm',    provider: 'gemini',     model: 'gemini-2.5-flash' },
-  { seat: 'Risk Manager',      role: 'risk',  provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free' },
-  { seat: 'Macro Analyst',     role: 'macro', provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free' },
-  { seat: 'Devil\u2019s Advocate', role: 'devil', provider: 'openrouter', model: 'deepseek/deepseek-chat-v3.1:free' }
+  { seat: 'Portfolio Manager', role: 'pm',    provider: 'gemini',     model: 'gemini-2.5-flash',                         fallbackProvider: 'openrouter', fallbackModel: 'meta-llama/llama-3.3-70b-instruct:free' },
+  { seat: 'Risk Manager',      role: 'risk',  provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free',  fallbackProvider: 'gemini',     fallbackModel: 'gemini-2.5-flash' },
+  { seat: 'Macro Analyst',     role: 'macro', provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free',               fallbackProvider: 'gemini',     fallbackModel: 'gemini-2.5-flash' },
+  { seat: 'Devil\u2019s Advocate', role: 'devil', provider: 'openrouter', model: 'deepseek/deepseek-chat-v3.1:free',    fallbackProvider: 'gemini',     fallbackModel: 'gemini-2.5-flash' }
 ];
 function loadSeats() {
   const env = process.env.COMMITTEE_SEATS;
@@ -581,25 +622,41 @@ app.post('/api/deep-triggers', async (req, res) => {
     const mandate = (ROLES[s.role] || ROLES[s.seat] || '') +
       (isDevil ? '\n\nYou may ONLY choose a verdict from: WATCH, HOLD, WAIT, REDUCE RISK. You never endorse buying. Make the bear case as strong as it can honestly be.' : '');
     const system = SYSTEM + '\n\nYOUR SEAT: ' + s.seat + '\nYOUR MANDATE: ' + mandate + '\n\n' + TASK + MODEL_ASK;
-    const raw = await callProvider(s.provider, s.model, packet, system);
-    if (!raw) return null;
-    const p = parseJsonLoose(raw) || {};
-    let verdict = coerceVerdict(p.verdict) || coerceVerdict(raw);
+    const res = await callWithFallback(s, packet, system);
+    if (!res.content) return { __failed: true, seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model, isDevil, reason: res.error || 'no response' };
+    const p = parseJsonLoose(res.content) || {};
+    let verdict = coerceVerdict(p.verdict) || coerceVerdict(res.content);
     if (isDevil) verdict = coerceDefensive(verdict);
     return {
       name: s.seat, seat: s.seat, role: roleLabel(s.role), isDevil, provider: s.provider, model: s.model,
+      modelUsed: res.modelUsed, providerUsed: res.providerUsed, usedFallback: res.usedFallback,
       verdict, independentVerdict: verdict,
       keyArgument: p.keyArgument || '', weakestAssumption: p.weakestAssumption || '',
       risk: p.risk || '', deploy: p.deploy || '',
-      text: p.reasoning || (typeof raw === 'string' ? raw.slice(0, 600) : '')
+      text: p.reasoning || (typeof res.content === 'string' ? res.content.slice(0, 600) : '')
     };
   }));
-  let models = r1.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
+  const r1res = r1.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
+  let models = r1res.filter(v => !v.__failed);
+  const failures = {}; r1res.filter(v => v.__failed).forEach(v => { failures[v.seat] = v.reason; });
+  const buildSeatStatus = () => seats.map(s => {
+    const m = models.find(x => x.seat === s.seat);
+    return {
+      seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model,
+      fallbackModel: s.fallbackModel || null, isDevil: s.role === 'devil',
+      status: m ? 'ok' : 'failed',
+      modelUsed: m ? (m.modelUsed || s.model) : null,
+      providerUsed: m ? (m.providerUsed || s.provider) : null,
+      usedFallback: m ? !!m.usedFallback : false,
+      verdict: m ? m.verdict : null, independentVerdict: m ? m.independentVerdict : null,
+      reason: m ? null : shortReason(failures[s.seat]), reasonDetail: m ? null : (failures[s.seat] || null)
+    };
+  });
   if (!models.length) {
     // Committee unavailable (e.g. all free seats rate-limited), but the Geopolitical Risk Officer is
     // independent and on a separate provider — still run it so the user gets the external-risk read.
     const geoRisk = await runGeoOfficer(req.body && req.body.geoPacket, null, ROLES);
-    return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No committee models responded (often the free-tier daily limit). Add OPENROUTER_API_KEY and/or GEMINI_API_KEY, or wait for the quota to reset.', ifIHad1000: null, idiotGuide: null, synthesised: false, seatsConfigured: seats.length, seatsResponded: 0, seatStatus: seats.map(s => ({ seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model, isDevil: s.role === 'devil', status: 'failed', verdict: null, independentVerdict: null })), tally: {}, geoRisk, ts: Date.now() });
+    return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No committee models responded (often the free-tier daily limit). Add OPENROUTER_API_KEY and/or GEMINI_API_KEY, or wait for the quota to reset.', ifIHad1000: null, idiotGuide: null, synthesised: false, seatsConfigured: seats.length, seatsResponded: 0, seatStatus: buildSeatStatus(), tally: {}, geoRisk, ts: Date.now() });
   }
 
   // ROUND 2 — rebuttal. Each seat sees the others' round-1 arguments and challenges the weakest.
@@ -612,13 +669,14 @@ app.post('/api/deep-triggers', async (req, res) => {
       const system = SYSTEM + '\n\nYOUR SEAT: ' + v.seat + '\nYOUR MANDATE: ' + (ROLES[s.role] || '') +
         (isDevil ? '\n\nYou are the DEVIL\u2019S ADVOCATE. Attack the emerging consensus. Name what the others are ignoring. Do not soften and do not endorse buying. Verdict must be one of: WATCH, HOLD, WAIT, REDUCE RISK.' : '\n\nThe other members have spoken. Challenge the single weakest argument among them, then state your FINAL position — change it only if genuinely persuaded.') +
         '\n\nOTHER MEMBERS\u2019 VIEWS:\n' + JSON.stringify(others) + '\n\n' + TASK + MODEL_ASK;
-      const raw = await callProvider(s.provider, s.model, packet, system);
-      if (!raw) return v;
-      const p = parseJsonLoose(raw) || {};
+      const res = await callWithFallback(s, packet, system);
+      if (!res.content) return v;   // keep the round-1 view if the rebuttal can't be produced
+      const p = parseJsonLoose(res.content) || {};
       let verdict = coerceVerdict(p.verdict) || v.verdict;
       if (isDevil) verdict = coerceDefensive(verdict);
       return Object.assign({}, v, {
-        verdict,
+        verdict, modelUsed: res.modelUsed || v.modelUsed, providerUsed: res.providerUsed || v.providerUsed,
+        usedFallback: res.usedFallback || v.usedFallback,
         keyArgument: p.keyArgument || v.keyArgument,
         weakestAssumption: p.weakestAssumption || v.weakestAssumption,
         risk: p.risk || v.risk, deploy: p.deploy || v.deploy,
@@ -637,14 +695,7 @@ app.post('/api/deep-triggers', async (req, res) => {
 
   // Seat status — covers EVERY configured seat, so a seat that failed/timed out is shown as 'failed'
   // (instead of silently dropping out and making the survivors look like 100% agreement).
-  const seatStatus = seats.map(s => {
-    const m = models.find(x => x.seat === s.seat);
-    return {
-      seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model,
-      isDevil: s.role === 'devil', status: m ? 'ok' : 'failed',
-      verdict: m ? m.verdict : null, independentVerdict: m ? m.independentVerdict : null
-    };
-  });
+  const seatStatus = buildSeatStatus();
   const seatsConfigured = seats.length, seatsResponded = models.length;
 
   // SYNTHESIS — the chair judges the strongest argument and makes ONE decisive call (does not average).
@@ -687,9 +738,9 @@ app.post('/api/deep-triggers', async (req, res) => {
   if (sbOn()) {
     sbAppend('committee_runs', [{
       ts: Date.now(), verdict, consensus, recommended: out.ifIHad1000, synth_by: out.synthBy, rounds: DEBATE_ROUNDS,
-      models: models.map(m => ({ seat: m.seat, role: m.role, provider: m.provider, model: m.model, status: 'ok', independentVerdict: m.independentVerdict, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })),
+      models: models.map(m => ({ seat: m.seat, role: m.role, provider: m.provider, model: m.model, modelUsed: m.modelUsed || m.model, usedFallback: !!m.usedFallback, status: 'ok', independentVerdict: m.independentVerdict, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })),
       detail: {
-        tally, seatsConfigured, seatsResponded, seatStatus,
+        tally, seatsConfigured, seatsResponded, seatStatus, failures,
         agree: out.agree, disagree: out.disagree, strongestArgument: out.strongestArgument,
         weakestAssumption: out.weakestAssumption, risk: out.risk, ifIHad1000: out.ifIHad1000,
         idiotGuide: out.idiotGuide, synthesised: out.synthesised, synthBy: out.synthBy, geoRisk: out.geoRisk
