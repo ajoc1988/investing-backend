@@ -86,8 +86,10 @@ app.get('/api/health', (req, res) => {
     keys: {
       etoro: !!ETORO_KEY, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
       openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY,
-      gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY
+      gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY,
+      openrouter: !!process.env.OPENROUTER_API_KEY
     },
+    committeeSeats: loadSeats().filter(s => providerHasKey(s.provider)).length,
     ts: Date.now()
   });
 });
@@ -307,10 +309,10 @@ const DEFAULTS = {
   'system-investing.md': 'You advise Andrew Collins, a long-term eToro ETF/stock investor in Bahrain. Advice only — never place trades, never suggest leverage/CFDs/options/shorting/crypto. Scope: portfolio, markets, dry powder, deployment, risk, opportunity. Be blunt and decision-led.',
   'deep-triggers.md': 'From your role, give a blunt independent read of the portfolio, market, the biggest risk, the best opportunity, and whether to deploy today and where. End with ONE verdict.',
   roles: {
-    ChatGPT: 'Investment strategist and deployment coach.',
-    Claude: 'Critical risk analyst and devil\'s advocate.',
-    Gemini: 'Quantitative market-data scanner.',
-    Perplexity: 'Research analyst with live web access.',
+    pm: 'Portfolio Manager. Focus on allocation, deployment of dry powder, hitting target weights, and long-term compounding. Pragmatic, action-oriented.',
+    devil: 'Risk Manager and Devil\u2019s Advocate. Your job is to attack the optimistic case, surface what everyone is ignoring, and protect against permanent loss. Be sceptical and blunt.',
+    macro: 'Macro Analyst. Read the VIX, yields, the yield curve, CPI and the Fed. Judge the regime and whether conditions favour deploying or waiting.',
+    news: 'News / Research Analyst. Weigh the headlines and catalysts in the packet. Separate signal from noise; flag anything that genuinely changes the picture.',
     synthesiser: 'You are the chair. Judge which argument is strongest given the data — do not average or vote. Make one decisive call.',
     idiotGuideStyle: 'Plain, blunt, no jargon. Concrete numeric actions.'
   }
@@ -332,7 +334,7 @@ function loadRoles() {
   if (txt) { try { return Object.assign({}, DEFAULTS.roles, JSON.parse(txt)); } catch (_) {} }
   return DEFAULTS.roles;
 }
-function roleLabel(name) { return { ChatGPT: 'strategist', Claude: 'risk analyst', Gemini: 'data scanner', Perplexity: 'web research' }[name] || ''; }
+function roleLabel(role) { return { pm: 'portfolio mgr', devil: 'risk / devil\u2019s advocate', macro: 'macro', news: 'news/research' }[role] || role || ''; }
 
 function parseJsonLoose(text) {
   if (!text) return null;
@@ -348,52 +350,81 @@ function coerceVerdict(v) {
 }
 
 // Each call takes (userContent, systemContent) so the handler controls the prompt.
-async function callOpenAI(user, system) {
+async function callOpenAI(user, system, modelOverride) {
   const key = process.env.OPENAI_API_KEY; if (!key) return null;
   const j = await getJson('https://api.openai.com/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-    body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4o-mini', temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
-  }, 35000);
+    body: JSON.stringify({ model: modelOverride || process.env.OPENAI_MODEL || 'gpt-4o-mini', temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
+  }, 40000);
   return j.choices && j.choices[0] && j.choices[0].message.content;
 }
-async function callAnthropic(user, system) {
+async function callAnthropic(user, system, modelOverride) {
   const key = process.env.ANTHROPIC_API_KEY; if (!key) return null;
   const j = await getJson('https://api.anthropic.com/v1/messages', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-latest', max_tokens: 900, system, messages: [{ role: 'user', content: user }] })
-  }, 35000);
+    body: JSON.stringify({ model: modelOverride || process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-latest', max_tokens: 900, system, messages: [{ role: 'user', content: user }] })
+  }, 40000);
   return j.content && j.content[0] && j.content[0].text;
 }
-async function callGemini(user, system) {
+async function callGemini(user, system, modelOverride) {
   const key = process.env.GEMINI_API_KEY; if (!key) return null;
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+  const model = modelOverride || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
   const j = await getJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts: [{ text: system + '\n\n' + user }] }] })
-  }, 35000);
+  }, 40000);
   return j.candidates && j.candidates[0] && j.candidates[0].content.parts[0].text;
 }
-async function callPerplexity(user, system) {
+async function callOpenRouter(user, system, modelOverride) {
+  const key = process.env.OPENROUTER_API_KEY; if (!key) return null;
+  const j = await getJson('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key,
+      'HTTP-Referer': 'https://investing-command-centre.local', 'X-Title': 'Investing Command Centre' },
+    body: JSON.stringify({ model: modelOverride || process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
+  }, 45000);
+  return j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+}
+async function callPerplexity(user, system, modelOverride) {
   const key = process.env.PERPLEXITY_API_KEY; if (!key) return null;
   const j = await getJson('https://api.perplexity.ai/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-    body: JSON.stringify({ model: process.env.PERPLEXITY_MODEL || 'sonar', temperature: 0.3, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
-  }, 35000);
+    body: JSON.stringify({ model: modelOverride || process.env.PERPLEXITY_MODEL || 'sonar', temperature: 0.3, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
+  }, 40000);
   return j.choices && j.choices[0] && j.choices[0].message.content;
 }
-const MODELS = [
-  { name: 'ChatGPT', call: callOpenAI }, { name: 'Claude', call: callAnthropic },
-  { name: 'Gemini', call: callGemini }, { name: 'Perplexity', call: callPerplexity }
+// Provider router — one entry per provider. OpenRouter alone covers many model families.
+const PROVIDERS = { openai: callOpenAI, anthropic: callAnthropic, gemini: callGemini, perplexity: callPerplexity, openrouter: callOpenRouter };
+function providerHasKey(p) {
+  return { openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY, gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY, openrouter: !!process.env.OPENROUTER_API_KEY }[p];
+}
+async function callProvider(provider, model, user, system) {
+  const fn = PROVIDERS[provider]; if (!fn) return null;
+  return fn(user, system, model);
+}
+
+// Committee seats — genuine diversity = different model FAMILIES + different roles.
+// Fully config-driven: set COMMITTEE_SEATS (a JSON array) in the environment to add/remove
+// models with NO code change. Seats whose provider has no key are skipped automatically.
+const DEFAULT_SEATS = [
+  { seat: 'Portfolio Manager',           role: 'pm',    provider: 'gemini',     model: 'gemini-2.5-flash' },
+  { seat: 'Risk / Devil\u2019s Advocate', role: 'devil', provider: 'openrouter', model: 'deepseek/deepseek-r1:free' },
+  { seat: 'Macro Analyst',               role: 'macro', provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free' }
 ];
-function hasKey(name) {
-  return { ChatGPT: !!process.env.OPENAI_API_KEY, Claude: !!process.env.ANTHROPIC_API_KEY, Gemini: !!process.env.GEMINI_API_KEY, Perplexity: !!process.env.PERPLEXITY_API_KEY }[name];
+function loadSeats() {
+  const env = process.env.COMMITTEE_SEATS;
+  if (env) { try { const a = JSON.parse(env); if (Array.isArray(a) && a.length) return a; } catch (_) {} }
+  return DEFAULT_SEATS;
 }
-// Synthesiser preference: Claude → ChatGPT → Gemini → Perplexity (first one with a key).
-function pickSynth() {
-  const order = ['Claude', 'ChatGPT', 'Gemini', 'Perplexity'];
-  for (const n of order) { if (hasKey(n)) return MODELS.find(m => m.name === n); }
-  return null;
+// Synthesiser: prefer an explicit env choice, else Gemini (reliable), else the first seat with a key.
+function pickSynth(seats) {
+  const ep = process.env.SYNTH_PROVIDER, em = process.env.SYNTH_MODEL;
+  if (ep && providerHasKey(ep)) return { seat: 'Chair', provider: ep, model: em || undefined };
+  if (providerHasKey('gemini')) return { seat: 'Chair', provider: 'gemini', model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' };
+  const s = seats.find(x => providerHasKey(x.provider));
+  return s ? { seat: 'Chair', provider: s.provider, model: s.model } : null;
 }
+const DEBATE_ROUNDS = Math.max(1, Math.min(2, +process.env.DEBATE_ROUNDS || 2));
 
 const MODEL_ASK = '\n\nRespond ONLY with compact JSON, no markdown:\n{"verdict":"<one of: ' + VERDICTS.join(' | ') + '>","keyArgument":"<your single strongest point>","weakestAssumption":"<the weakest assumption in the optimistic case>","risk":"<the biggest risk being ignored>","deploy":"<exact $ split for new cash today, or WAIT FOR <event>>","reasoning":"<2-3 blunt sentences>"}';
 const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","ifIHad1000":"<exact $ split totalling 1000, or WAIT FOR <event>>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
@@ -405,57 +436,94 @@ app.post('/api/deep-triggers', async (req, res) => {
   const SYSTEM = loadPrompt('system-investing.md');
   const TASK = loadPrompt('deep-triggers.md');
   const ROLES = loadRoles();
+  const seats = loadSeats().filter(s => providerHasKey(s.provider));
 
-  // 1) Independent views — each model analyses the same packet in its own role.
-  const results = await Promise.allSettled(MODELS.map(async m => {
-    if (!hasKey(m.name)) return null;
-    const system = SYSTEM + '\n\nYOUR ROLE: ' + (ROLES[m.name] || '') + '\n\n' + TASK + MODEL_ASK;
-    const raw = await m.call(packet, system);
+  // ROUND 1 — independent views. Each seat (a distinct model family) reads the same packet in its own role.
+  const r1 = await Promise.allSettled(seats.map(async s => {
+    const mandate = ROLES[s.role] || ROLES[s.seat] || '';
+    const system = SYSTEM + '\n\nYOUR SEAT: ' + s.seat + '\nYOUR MANDATE: ' + mandate + '\n\n' + TASK + MODEL_ASK;
+    const raw = await callProvider(s.provider, s.model, packet, system);
     if (!raw) return null;
     const p = parseJsonLoose(raw) || {};
     return {
-      name: m.name, role: roleLabel(m.name),
+      name: s.seat, seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model,
       verdict: coerceVerdict(p.verdict) || coerceVerdict(raw),
       keyArgument: p.keyArgument || '', weakestAssumption: p.weakestAssumption || '',
       risk: p.risk || '', deploy: p.deploy || '',
       text: p.reasoning || (typeof raw === 'string' ? raw.slice(0, 600) : '')
     };
   }));
-  const models = results.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
-  if (!models.length) return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No AI models configured. Set at least one key (OPENAI/ANTHROPIC/GEMINI/PERPLEXITY).', ifIHad1000: null, idiotGuide: null, synthesised: false, ts: Date.now() });
+  let models = r1.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
+  if (!models.length) return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No AI models responded. Add OPENROUTER_API_KEY and/or GEMINI_API_KEY, or check the model IDs in COMMITTEE_SEATS.', ifIHad1000: null, idiotGuide: null, synthesised: false, ts: Date.now() });
 
-  // consensus = how much the independent models agree (NOT the final call)
+  // ROUND 2 — rebuttal. Each seat sees the others' round-1 arguments and challenges the weakest.
+  // The Devil's Advocate is told explicitly to attack the consensus. Best-effort: a failed rebuttal keeps the round-1 view.
+  if (DEBATE_ROUNDS >= 2 && models.length >= 2) {
+    const r2 = await Promise.allSettled(models.map(async v => {
+      const s = seats.find(x => x.seat === v.seat) || {};
+      const isDevil = s.role === 'devil';
+      const others = models.filter(o => o.seat !== v.seat).map(o => ({ seat: o.seat, verdict: o.verdict, keyArgument: o.keyArgument, risk: o.risk }));
+      const system = SYSTEM + '\n\nYOUR SEAT: ' + v.seat + '\nYOUR MANDATE: ' + (ROLES[s.role] || '') +
+        (isDevil ? '\n\nYou are the DEVIL\u2019S ADVOCATE. Attack the emerging consensus. Name what the others are ignoring. Do not soften.' : '\n\nThe other members have spoken. Challenge the single weakest argument among them, then state your FINAL position — change it only if genuinely persuaded.') +
+        '\n\nOTHER MEMBERS\u2019 VIEWS:\n' + JSON.stringify(others) + '\n\n' + TASK + MODEL_ASK;
+      const raw = await callProvider(s.provider, s.model, packet, system);
+      if (!raw) return v;
+      const p = parseJsonLoose(raw) || {};
+      return Object.assign({}, v, {
+        verdict: coerceVerdict(p.verdict) || v.verdict,
+        keyArgument: p.keyArgument || v.keyArgument,
+        weakestAssumption: p.weakestAssumption || v.weakestAssumption,
+        risk: p.risk || v.risk, deploy: p.deploy || v.deploy,
+        text: p.reasoning || v.text, rebutted: true
+      });
+    }));
+    models = r2.map((r, i) => r.status === 'fulfilled' ? r.value : models[i]);
+  }
+
+  // consensus = how much the seats agree after debate (NOT the final call)
   const verdicts = models.map(m => m.verdict).filter(Boolean);
   const tally = {}; verdicts.forEach(v => tally[v] = (tally[v] || 0) + 1);
   let top = null, topN = 0;
   Object.entries(tally).forEach(([k, n]) => { if (n > topN || (n === topN && top && STANCE[k] < STANCE[top])) { top = k; topN = n; } });
   const consensus = verdicts.length ? Math.round(topN / verdicts.length * 100) : 0;
 
-  // 2) Synthesiser — judges the strongest argument and makes ONE decisive call.
+  // SYNTHESIS — the chair judges the strongest argument and makes ONE decisive call (does not average).
   let synth = null;
-  const synthModel = pickSynth();
+  const synthModel = pickSynth(seats);
   if (synthModel) {
     try {
       const system = SYSTEM + '\n\nYOU ARE THE COMMITTEE CHAIR / SYNTHESISER.\n' + (ROLES.synthesiser || '') + '\n\nIdiot\'s Guide style: ' + (ROLES.idiotGuideStyle || '') + SYNTH_ASK;
-      const user = 'DATA PACKET:\n' + packet + '\n\nINDEPENDENT MODEL VIEWS:\n' + JSON.stringify(models.map(m => ({ model: m.name, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })), null, 1);
-      const raw = await synthModel.call(user, system);
+      const user = 'DATA PACKET:\n' + packet + '\n\nCOMMITTEE VIEWS (after debate):\n' + JSON.stringify(models.map(m => ({ seat: m.seat, model: m.model, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })), null, 1);
+      const raw = await callProvider(synthModel.provider, synthModel.model, user, system);
       synth = parseJsonLoose(raw);
     } catch (_) { /* fall back to majority below */ }
   }
 
   const verdict = (synth && coerceVerdict(synth.finalVerdict)) || top;
-  res.json({
+  const out = {
     models, consensus, verdict,
     agree: (synth && synth.agree) || [],
-    disagree: (synth && synth.disagree) || [],
+    disagree: (synth && synth.disagree) || (models.length > 1 && verdicts.length > 1 && new Set(verdicts).size > 1 ? ['Seats split: ' + verdicts.join(', ')] : []),
     strongestArgument: (synth && synth.strongestArgument) || '',
     weakestAssumption: (synth && synth.weakestAssumption) || models.map(m => m.weakestAssumption).filter(Boolean)[0] || '',
     risk: (synth && synth.riskWarning) || models.map(m => m.risk).filter(Boolean)[0] || '',
     ifIHad1000: (synth && synth.ifIHad1000) || models.map(m => m.deploy).filter(Boolean)[0] || null,
     idiotGuide: (synth && synth.idiotGuide) || null,
-    synthesised: !!synth, synthBy: synthModel ? synthModel.name : null,
+    synthesised: !!synth, synthBy: synthModel ? synthModel.provider : null,
+    rounds: DEBATE_ROUNDS, seats: models.length,
     ts: Date.now()
-  });
+  };
+  res.json(out);
+
+  // History — log this run server-side for the long-term dataset (per-seat verdicts + market packet).
+  // Fire-and-forget: never blocks or crashes the response.
+  if (sbOn()) {
+    sbAppend('committee_runs', [{
+      ts: Date.now(), verdict, consensus, recommended: out.ifIHad1000, synth_by: out.synthBy, rounds: DEBATE_ROUNDS,
+      models: models.map(m => ({ seat: m.seat, provider: m.provider, model: m.model, verdict: m.verdict, keyArgument: m.keyArgument, risk: m.risk })),
+      packet
+    }]).catch(() => {});
+  }
 });
 
 /* ───────── Prompt management (admin) ───────── */
@@ -522,17 +590,25 @@ function mapJournal(e) {
     recommended_action: e.recommendedAction, actual_action: e.actualAction || null, notes: e.notes || null,
     outcome: e.outcome || null, outcome_ts: iso(e.outcomeTs), updated_at: new Date().toISOString() };
 }
+function mapCommitteeRun(e) {
+  return { ts: iso(e.ts) || new Date().toISOString(), verdict: e.verdict, consensus: e.consensus,
+    recommended: e.recommended || null, synth_by: e.synth_by || null, rounds: e.rounds || null,
+    models: e.models || [], packet: e.packet || null };
+}
 async function sbAppend(type, incoming) {
   if (type === 'journal') {
     const r = await fetch(`${SB_URL}/rest/v1/journal?on_conflict=id`, { method: 'POST', headers: { ...sbHeaders(true), Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(incoming.map(mapJournal)) });
     if (!r.ok) throw new Error('supabase journal ' + r.status + ' ' + (await r.text()).slice(0, 160));
+  } else if (type === 'committee_runs') {
+    const r = await fetch(`${SB_URL}/rest/v1/committee_runs`, { method: 'POST', headers: { ...sbHeaders(true), Prefer: 'return=minimal' }, body: JSON.stringify(incoming.map(mapCommitteeRun)) });
+    if (!r.ok) throw new Error('supabase committee_runs ' + r.status + ' ' + (await r.text()).slice(0, 160));
   } else {
     const r = await fetch(`${SB_URL}/rest/v1/snapshots`, { method: 'POST', headers: { ...sbHeaders(true), Prefer: 'return=minimal' }, body: JSON.stringify(incoming.map(mapSnap)) });
     if (!r.ok) throw new Error('supabase snapshots ' + r.status + ' ' + (await r.text()).slice(0, 160));
   }
 }
 async function sbRead(type, limit) {
-  const table = type === 'journal' ? 'journal' : 'snapshots';
+  const table = type === 'journal' ? 'journal' : type === 'committee_runs' ? 'committee_runs' : 'snapshots';
   const r = await fetch(`${SB_URL}/rest/v1/${table}?select=*&order=ts.desc&limit=${limit}`, { headers: sbHeaders(false) });
   if (!r.ok) throw new Error('supabase read ' + r.status);
   const rows = await r.json();
@@ -546,6 +622,7 @@ app.get('/api/history', async (req, res) => {
     try {
       if (type === 'snapshots') return res.json({ snapshots: await sbRead('snapshots', limit), backend: 'supabase', ts: Date.now() });
       if (type === 'journal') return res.json({ journal: await sbRead('journal', limit), backend: 'supabase', ts: Date.now() });
+      if (type === 'committee_runs') return res.json({ committee_runs: await sbRead('committee_runs', limit), backend: 'supabase', ts: Date.now() });
       const [snapshots, journal] = await Promise.all([sbRead('snapshots', limit), sbRead('journal', limit)]);
       return res.json({ snapshots, journal, backend: 'supabase', ts: Date.now() });
     } catch (e) { /* fall through to file store */ }
