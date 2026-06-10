@@ -334,6 +334,20 @@ app.get('/api/portfolio', async (req, res) => {
         mirrorPositionKeys: m0 ? Object.keys(m0) : []
       });
     }
+    if (req.query.debug === '2') {
+      // Diagnostic: numeric values for the first 3 positions, to derive the correct P/L formula. Remove after.
+      const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
+      const cp = (raw && (raw.clientPortfolio || raw)) || {};
+      const positions = Array.isArray(cp.positions) ? cp.positions : [];
+      const pick = positions.slice(0, 3).map(p => ({
+        instrumentID: p.instrumentID ?? p.instrumentId,
+        units: p.units, openRate: p.openRate,
+        amount: p.amount, initialAmountInDollars: p.initialAmountInDollars,
+        unitsBaseValueDollars: p.unitsBaseValueDollars, unrealizedPnL: p.unrealizedPnL,
+        totalFees: p.totalFees, isBuy: p.isBuy, leverage: p.leverage
+      }));
+      return res.json({ debug2: true, portfolioUnrealizedPnL: cp.unrealizedPnL, credit: cp.credit, samplePositions: pick });
+    }
     const data = await cached('portfolio', 60000, async () => {
       // READ-ONLY request to eToro's PnL/portfolio endpoint. No order/trade endpoints are ever called.
       const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
