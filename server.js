@@ -326,35 +326,6 @@ app.get('/api/portfolio', async (req, res) => {
     });
   }
   try {
-    if (req.query.debug === '1') {
-      // Diagnostic: returns FIELD NAMES ONLY (no amounts) so we can map P/L exactly. Remove after.
-      const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
-      const cp = (raw && (raw.clientPortfolio || raw)) || {};
-      const positions = Array.isArray(cp.positions) ? cp.positions : [];
-      const m0 = cp.mirrors && cp.mirrors[0] && Array.isArray(cp.mirrors[0].positions) ? cp.mirrors[0].positions[0] : null;
-      return res.json({
-        debug: true,
-        positionCount: positions.length,
-        mirrorsCount: Array.isArray(cp.mirrors) ? cp.mirrors.length : 0,
-        portfolioKeys: Object.keys(cp),
-        positionKeys: positions[0] ? Object.keys(positions[0]) : [],
-        mirrorPositionKeys: m0 ? Object.keys(m0) : []
-      });
-    }
-    if (req.query.debug === '2') {
-      // Diagnostic: numeric values for the first 3 positions, to derive the correct P/L formula. Remove after.
-      const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
-      const cp = (raw && (raw.clientPortfolio || raw)) || {};
-      const positions = Array.isArray(cp.positions) ? cp.positions : [];
-      const pick = positions.slice(0, 3).map(p => ({
-        instrumentID: p.instrumentID ?? p.instrumentId,
-        units: p.units, openRate: p.openRate,
-        amount: p.amount, initialAmountInDollars: p.initialAmountInDollars,
-        unitsBaseValueDollars: p.unitsBaseValueDollars, unrealizedPnL: p.unrealizedPnL,
-        totalFees: p.totalFees, isBuy: p.isBuy, leverage: p.leverage
-      }));
-      return res.json({ debug2: true, portfolioUnrealizedPnL: cp.unrealizedPnL, credit: cp.credit, samplePositions: pick });
-    }
     const data = await cached('portfolio', 60000, async () => {
       // READ-ONLY request to eToro's PnL/portfolio endpoint. No order/trade endpoints are ever called.
       const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
@@ -615,13 +586,28 @@ app.post('/api/deep-triggers', async (req, res) => {
   Object.entries(tally).forEach(([k, n]) => { if (n > topN || (n === topN && top && STANCE[k] < STANCE[top])) { top = k; topN = n; } });
   const consensus = verdicts.length ? Math.round(topN / verdicts.length * 100) : 0;
 
+  // Seat status — covers EVERY configured seat, so a seat that failed/timed out is shown as 'failed'
+  // (instead of silently dropping out and making the survivors look like 100% agreement).
+  const seatStatus = seats.map(s => {
+    const m = models.find(x => x.seat === s.seat);
+    return {
+      seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model,
+      isDevil: s.role === 'devil', status: m ? 'ok' : 'failed',
+      verdict: m ? m.verdict : null, independentVerdict: m ? m.independentVerdict : null
+    };
+  });
+  const seatsConfigured = seats.length, seatsResponded = models.length;
+
   // SYNTHESIS — the chair judges the strongest argument and makes ONE decisive call (does not average).
   let synth = null;
   const synthModel = pickSynth(seats);
   if (synthModel) {
     try {
       const system = SYSTEM + '\n\nYOU ARE THE COMMITTEE CHAIR / SYNTHESISER.\n' + (ROLES.synthesiser || '') + '\n\nIdiot\'s Guide style: ' + (ROLES.idiotGuideStyle || '') + SYNTH_ASK;
-      const user = 'DATA PACKET:\n' + packet + '\n\nCOMMITTEE VIEWS (after debate):\n' + JSON.stringify(models.map(m => ({ seat: m.seat, model: m.model, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })), null, 1);
+      const absent = seatStatus.filter(s => s.status === 'failed').map(s => s.seat);
+      const user = 'DATA PACKET:\n' + packet + '\n\nCOMMITTEE VIEWS (after debate):\n' + JSON.stringify(models.map(m => ({ seat: m.seat, model: m.model, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })), null, 1) +
+        '\n\nNOTE: The members listed above are the ONLY ones who responded (' + seatsResponded + ' of ' + seatsConfigured + ').' +
+        (absent.length ? ' These seats did NOT respond and have NO view this run: ' + absent.join(', ') + '. Do NOT invent, quote, paraphrase, or attribute any opinion to them. If the Devil\u2019s Advocate is among the absent, explicitly note the bear case was not heard rather than imagining what it "would" say.' : '');
       const raw = await callProvider(synthModel.provider, synthModel.model, user, system);
       synth = parseJsonLoose(raw);
     } catch (_) { /* fall back to majority below */ }
@@ -639,16 +625,23 @@ app.post('/api/deep-triggers', async (req, res) => {
     idiotGuide: (synth && synth.idiotGuide) || null,
     synthesised: !!synth, synthBy: synthModel ? synthModel.provider : null,
     rounds: DEBATE_ROUNDS, seats: models.length,
+    tally, seatStatus, seatsConfigured, seatsResponded,
     ts: Date.now()
   };
   res.json(out);
 
-  // History — log this run server-side for the long-term dataset (per-seat verdicts + market packet).
-  // Fire-and-forget: never blocks or crashes the response.
+  // History — log this run server-side for the long-term dataset (per-seat verdicts + full synthesis + packet).
+  // Fire-and-forget: never blocks or crashes the response. This is the long-term performance goldmine.
   if (sbOn()) {
     sbAppend('committee_runs', [{
       ts: Date.now(), verdict, consensus, recommended: out.ifIHad1000, synth_by: out.synthBy, rounds: DEBATE_ROUNDS,
-      models: models.map(m => ({ seat: m.seat, role: m.role, provider: m.provider, model: m.model, independentVerdict: m.independentVerdict, verdict: m.verdict, keyArgument: m.keyArgument, risk: m.risk })),
+      models: models.map(m => ({ seat: m.seat, role: m.role, provider: m.provider, model: m.model, status: 'ok', independentVerdict: m.independentVerdict, verdict: m.verdict, keyArgument: m.keyArgument, weakestAssumption: m.weakestAssumption, risk: m.risk, deploy: m.deploy, reasoning: m.text })),
+      detail: {
+        tally, seatsConfigured, seatsResponded, seatStatus,
+        agree: out.agree, disagree: out.disagree, strongestArgument: out.strongestArgument,
+        weakestAssumption: out.weakestAssumption, risk: out.risk, ifIHad1000: out.ifIHad1000,
+        idiotGuide: out.idiotGuide, synthesised: out.synthesised, synthBy: out.synthBy
+      },
       packet
     }]).catch(() => {});
   }
@@ -721,7 +714,7 @@ function mapJournal(e) {
 function mapCommitteeRun(e) {
   return { ts: iso(e.ts) || new Date().toISOString(), verdict: e.verdict, consensus: e.consensus,
     recommended: e.recommended || null, synth_by: e.synth_by || null, rounds: e.rounds || null,
-    models: e.models || [], packet: e.packet || null };
+    models: e.models || [], detail: e.detail || {}, packet: e.packet || null };
 }
 async function sbAppend(type, incoming) {
   if (type === 'journal') {
