@@ -263,6 +263,25 @@ async function etoroSymbols(ids) {
   return out;
 }
 // Map eToro clientPortfolio -> our normalised portfolio. Long-only real-asset investor: value = invested + unrealised P/L.
+// Estimate TODAY's P/L from live per-share daily change (Finnhub 'd') × units held, summed.
+// This is an ESTIMATE — eToro's own "today" figure uses its own pricing and fractional shares,
+// so expect it to be within a dollar or two, not penny-exact.
+async function estimateTodayPl(holdings) {
+  if (!FINNHUB || !Array.isArray(holdings) || !holdings.length) return { todayPlUsd: null, partial: false, covered: 0, total: 0 };
+  let sum = 0, covered = 0;
+  await Promise.all(holdings.map(async h => {
+    const sym = String(h.symbol || '').toUpperCase();
+    const units = n2(h.units);
+    if (!sym || sym.startsWith('ID') || !units) return;
+    try {
+      const j = await getJson(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB}`);
+      if (j && typeof j.d === 'number' && j.c) { sum += units * j.d; covered++; }
+    } catch (_) { /* skip this symbol */ }
+  }));
+  if (!covered) return { todayPlUsd: null, partial: true, covered: 0, total: holdings.length };
+  return { todayPlUsd: +sum.toFixed(2), partial: covered < holdings.length, covered, total: holdings.length };
+}
+
 async function mapEtoroPnl(raw) {
   const cp = (raw && (raw.clientPortfolio || raw)) || {};
   const positions = Array.isArray(cp.positions) ? cp.positions : [];
@@ -298,7 +317,16 @@ async function mapEtoroPnl(raw) {
   const cash = n2(cp.credit) || 0;   // 'credit' = funds available for new actions (buying power); bonusCredit excluded
   const cpPnl = cp.unrealizedPnL;
   const totalPl = (cpPnl && typeof cpPnl === 'object') ? n2(cpPnl.pnL ?? cpPnl.pnlAssetCurrency) : n2(cpPnl);
-  return normalisePortfolio({ holdings, availableCashUsd: cash, totalPlUsd: totalPl, todayPlUsd: null });
+  const today = await estimateTodayPl(holdings);
+  const out = normalisePortfolio({ holdings, availableCashUsd: cash, totalPlUsd: totalPl, todayPlUsd: today.todayPlUsd });
+  out.todayPlEstimated = today.todayPlUsd != null;        // true → label it "est." in the UI
+  out.todayPlPartial = !!today.partial;                   // some symbols had no live quote
+  out.todayPlCovered = today.covered; out.todayPlTotal = today.total;
+  if (today.todayPlUsd != null) {
+    const prev = (out.portfolioValueUsd || 0) - today.todayPlUsd;
+    out.todayPlPct = prev > 0 ? +((today.todayPlUsd / prev) * 100).toFixed(2) : null;
+  }
+  return out;
 }
 function normalisePortfolio(p) {
   const holdings = (p.holdings || []).map(h => {
