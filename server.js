@@ -33,6 +33,12 @@ const ETORO_USER_KEY = process.env.ETORO_USER_KEY || '';    // x-user-key (the e
 const ETORO_ENV = (process.env.ETORO_ENV || 'real').toLowerCase() === 'demo' ? 'demo' : 'real';
 const ETORO_BASE = (process.env.ETORO_API_URL || 'https://public-api.etoro.com').replace(/\/+$/, '');
 const ETORO_ON = !!(ETORO_KEY && ETORO_USER_KEY);
+// Grok (xAI) — optional Geopolitical Risk Officer. NOT a voting seat. Off until GROK_API_KEY is set.
+// Never receives portfolio holdings or history. Live/web search is a paid tool, OFF unless GROK_LIVE_SEARCH=on.
+const GROK_KEY = process.env.GROK_API_KEY || process.env.XAI_API_KEY || '';
+const GROK_MODEL = process.env.GROK_MODEL || 'grok-4.3';
+const GROK_LIVE_SEARCH = String(process.env.GROK_LIVE_SEARCH || '').toLowerCase() === 'on';
+const GROK_ON = !!GROK_KEY;
 
 /* ───────── tiny utilities ───────── */
 async function getJson(url, opts = {}, ms = 9000) {
@@ -90,9 +96,10 @@ app.get('/api/health', (req, res) => {
       etoro: ETORO_ON, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
       openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY,
       gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY,
-      openrouter: !!process.env.OPENROUTER_API_KEY
+      openrouter: !!process.env.OPENROUTER_API_KEY, grok: GROK_ON
     },
     committeeSeats: loadSeats().filter(s => providerHasKey(s.provider)).length,
+    geoOfficer: GROK_ON ? { on: true, model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH } : { on: false },
     ts: Date.now()
   });
 });
@@ -450,10 +457,22 @@ async function callPerplexity(user, system, modelOverride) {
   }, 40000);
   return j.choices && j.choices[0] && j.choices[0].message.content;
 }
+async function callGrok(user, system, modelOverride) {
+  const key = process.env.GROK_API_KEY || process.env.XAI_API_KEY; if (!key) return null;
+  const body = { model: modelOverride || GROK_MODEL, temperature: 0.4, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] };
+  // Live/web search is an opt-in PAID tool (~$5/1000 calls). Stays OFF unless GROK_LIVE_SEARCH=on.
+  // When enabled later, confirm the current tool shape in xAI docs before relying on it.
+  if (GROK_LIVE_SEARCH) body.tools = [{ type: 'web_search' }];
+  const j = await getJson('https://api.x.ai/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+    body: JSON.stringify(body)
+  }, 45000);
+  return j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+}
 // Provider router — one entry per provider. OpenRouter alone covers many model families.
-const PROVIDERS = { openai: callOpenAI, anthropic: callAnthropic, gemini: callGemini, perplexity: callPerplexity, openrouter: callOpenRouter };
+const PROVIDERS = { openai: callOpenAI, anthropic: callAnthropic, gemini: callGemini, perplexity: callPerplexity, openrouter: callOpenRouter, xai: callGrok };
 function providerHasKey(p) {
-  return { openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY, gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY, openrouter: !!process.env.OPENROUTER_API_KEY }[p];
+  return { openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY, gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY, openrouter: !!process.env.OPENROUTER_API_KEY, xai: !!(process.env.GROK_API_KEY || process.env.XAI_API_KEY) }[p];
 }
 async function callProvider(provider, model, user, system) {
   const fn = PROVIDERS[provider]; if (!fn) return null;
@@ -508,6 +527,7 @@ function buildMemory(runs, journal) {
 
 const MODEL_ASK = '\n\nRespond ONLY with compact JSON, no markdown:\n{"verdict":"<one of: ' + VERDICTS.join(' | ') + '>","keyArgument":"<your single strongest point>","weakestAssumption":"<the weakest assumption in the optimistic case>","risk":"<the biggest risk being ignored>","deploy":"<exact $ split for new cash today, or WAIT FOR <event>>","reasoning":"<2-3 blunt sentences>"}';
 const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","ifIHad1000":"<exact $ split totalling 1000, or WAIT FOR <event>>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
+const GEO_ASK = '\n\nYou are NOT a market analyst and you do NOT give buy/sell/hold advice. You never see the portfolio. Your ONLY job: name near-term (next 1\u20134 weeks) GLOBAL or GEOPOLITICAL events that could make the committee\u2019s verdict wrong \u2014 wars, sanctions, elections, oil/energy shocks, central-bank surprises, tariffs, major-power tensions.\n\nRespond ONLY with compact JSON, no markdown:\n{"summary":"<2 sentences on the geopolitical risk backdrop right now>","events":["<near-term event + date if known + why it matters to markets>","..."],"couldMakeWrong":"<the single scenario most likely to blindside the committee\u2019s verdict>","watch":"<the one headline or indicator to watch>"}';
 
 app.post('/api/deep-triggers', async (req, res) => {
   const packet = req.body && req.body.packet;
@@ -628,6 +648,27 @@ app.post('/api/deep-triggers', async (req, res) => {
     tally, seatStatus, seatsConfigured, seatsResponded,
     ts: Date.now()
   };
+
+  // GEOPOLITICAL RISK OFFICER (Grok) — runs SEPARATELY from the voting committee and is NOT in the tally.
+  // One job: what global event could make this verdict wrong? It NEVER receives portfolio holdings or
+  // history — only the macro/market/news context the dashboard sends as geoPacket. Best-effort, never blocks.
+  let geoRisk = null;
+  const geoPacket = req.body && req.body.geoPacket;
+  if (GROK_ON && typeof geoPacket === 'string' && geoPacket.trim()) {
+    try {
+      const geoSystem = (ROLES.geopolitics || 'You are the committee\u2019s Geopolitical Risk Officer.') + GEO_ASK;
+      const geoUser = 'MACRO / MARKET / NEWS CONTEXT (no portfolio data):\n' + geoPacket +
+        '\n\nThe investment committee just reached this verdict: ' + (verdict || 'n/a') +
+        '.\nName the near-term global/geopolitical events that could make that verdict wrong, and the one thing to watch.';
+      const g = parseJsonLoose(await callGrok(geoUser, geoSystem));
+      if (g) geoRisk = {
+        summary: g.summary || '', events: Array.isArray(g.events) ? g.events.slice(0, 5) : [],
+        couldMakeWrong: g.couldMakeWrong || '', watch: g.watch || '',
+        by: 'grok', model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH
+      };
+    } catch (_) { geoRisk = null; }
+  }
+  out.geoRisk = geoRisk;
   res.json(out);
 
   // History — log this run server-side for the long-term dataset (per-seat verdicts + full synthesis + packet).
@@ -640,7 +681,7 @@ app.post('/api/deep-triggers', async (req, res) => {
         tally, seatsConfigured, seatsResponded, seatStatus,
         agree: out.agree, disagree: out.disagree, strongestArgument: out.strongestArgument,
         weakestAssumption: out.weakestAssumption, risk: out.risk, ifIHad1000: out.ifIHad1000,
-        idiotGuide: out.idiotGuide, synthesised: out.synthesised, synthBy: out.synthBy
+        idiotGuide: out.idiotGuide, synthesised: out.synthesised, synthBy: out.synthBy, geoRisk: out.geoRisk
       },
       packet
     }]).catch(() => {});
