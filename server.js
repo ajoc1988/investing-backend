@@ -28,8 +28,11 @@ const PORT = process.env.PORT || 8787;
 const FINNHUB = process.env.FINNHUB_API_KEY || '';
 const FRED = process.env.FRED_API_KEY || '';
 // eToro read-only. We never request or send trade/order/leverage scopes.
-const ETORO_KEY = process.env.ETORO_API_KEY || '';
-const ETORO_URL = process.env.ETORO_API_URL || '';
+const ETORO_KEY = process.env.ETORO_API_KEY || '';          // x-api-key (Public Key)
+const ETORO_USER_KEY = process.env.ETORO_USER_KEY || '';    // x-user-key (the eyJ… User Key)
+const ETORO_ENV = (process.env.ETORO_ENV || 'real').toLowerCase() === 'demo' ? 'demo' : 'real';
+const ETORO_BASE = (process.env.ETORO_API_URL || 'https://public-api.etoro.com').replace(/\/+$/, '');
+const ETORO_ON = !!(ETORO_KEY && ETORO_USER_KEY);
 
 /* ───────── tiny utilities ───────── */
 async function getJson(url, opts = {}, ms = 9000) {
@@ -84,7 +87,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     keys: {
-      etoro: !!ETORO_KEY, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
+      etoro: ETORO_ON, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
       openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY,
       gemini: !!process.env.GEMINI_API_KEY, perplexity: !!process.env.PERPLEXITY_API_KEY,
       openrouter: !!process.env.OPENROUTER_API_KEY
@@ -231,21 +234,57 @@ app.get('/api/news', async (req, res) => {
  * returns source:"manual" so the dashboard keeps using manual/last-known data.
  */
 function n2(v) { const x = num(v); return x == null ? null : x; }
-function mapEtoro(raw) {
-  // Accept either our already-normalised shape (from your own read-only adapter)
-  // or a generic eToro-style positions payload. Best-effort, never throws.
-  if (raw && Array.isArray(raw.holdings)) return normalisePortfolio(raw); // already-normalised passthrough
-  const positions = (raw && (raw.positions || raw.holdings || raw.instruments || raw.assets)) || [];
-  const cash = n2(raw && (raw.availableCashUsd ?? raw.cash ?? raw.availableCash ?? raw.realizedCredit));
-  const holdings = (Array.isArray(positions) ? positions : []).map(p => ({
-    symbol: String(p.symbol || p.ticker || p.instrumentName || p.name || '').toUpperCase(),
-    name: p.name || p.instrumentName || p.symbol || '',
-    units: n2(p.units ?? p.amount ?? p.quantity ?? p.shares),
-    currentPrice: n2(p.currentPrice ?? p.price ?? p.marketPrice ?? p.rate),
-    valueUsd: n2(p.valueUsd ?? p.value ?? p.marketValue),
-    plUsd: n2(p.plUsd ?? p.pl ?? p.profit ?? p.unrealizedPl),
-  })).filter(h => h.symbol);
-  return normalisePortfolio({ holdings, availableCashUsd: cash, todayPlUsd: n2(raw && raw.todayPlUsd), totalPlUsd: n2(raw && raw.totalPlUsd) });
+const crypto = require('crypto');
+function etoroHeaders() {
+  return { 'x-request-id': crypto.randomUUID(), 'x-api-key': ETORO_KEY, 'x-user-key': ETORO_USER_KEY, 'Accept': 'application/json' };
+}
+// Resolve eToro numeric instrument IDs -> ticker symbols (symbolFull). Cached long, since symbols don't change.
+async function etoroSymbols(ids) {
+  const out = {};
+  const need = [];
+  ids.forEach(id => { const hit = cache.get('etoroSym:' + id); if (hit && hit.exp > Date.now()) out[id] = hit.data; else need.push(id); });
+  if (need.length) {
+    const url = `${ETORO_BASE}/api/v1/market-data/instruments?instrumentIds=${need.join(',')}`;
+    const j = await getJson(url, { headers: etoroHeaders() }, 12000);
+    const arr = (j && (j.instrumentDisplayDatas || j.instruments)) || [];
+    arr.forEach(d => {
+      const id = d.instrumentID ?? d.instrumentId;
+      const rec = { symbol: String(d.symbolFull || '').toUpperCase(), name: d.instrumentDisplayName || d.symbolFull || '' };
+      if (id != null) { out[id] = rec; cache.set('etoroSym:' + id, { data: rec, exp: Date.now() + 86400000 }); }
+    });
+  }
+  return out;
+}
+// Map eToro clientPortfolio -> our normalised portfolio. Long-only real-asset investor: value = invested + unrealised P/L.
+async function mapEtoroPnl(raw) {
+  const cp = (raw && (raw.clientPortfolio || raw)) || {};
+  const positions = Array.isArray(cp.positions) ? cp.positions : [];
+  // aggregate positions by instrument
+  const byId = {};
+  positions.forEach(p => {
+    const id = p.instrumentId ?? p.instrumentID;
+    if (id == null) return;
+    const invested = n2(p.initialAmountInDollars ?? p.unitsBaseValueDollars ?? p.amount) || 0;
+    const pnl = n2(p.pnL ?? p.pnl) || 0;
+    const units = n2(p.units) || 0;
+    const a = byId[id] || (byId[id] = { value: 0, units: 0, pl: 0 });
+    a.value += invested + pnl; a.units += units; a.pl += pnl;
+  });
+  const ids = Object.keys(byId);
+  let symMap = {};
+  try { if (ids.length) symMap = await etoroSymbols(ids); } catch (_) { /* symbols best-effort */ }
+  const holdings = ids.map(id => {
+    const a = byId[id], s = symMap[id] || {};
+    const valueUsd = +(a.value).toFixed(2);
+    const units = a.units;
+    return {
+      symbol: s.symbol || ('ID' + id), name: s.name || ('Instrument ' + id),
+      units, currentPrice: units > 0 ? +(valueUsd / units).toFixed(4) : null,
+      valueUsd, plUsd: +(a.pl).toFixed(2)
+    };
+  }).filter(h => h.valueUsd > 0);
+  const cash = n2(cp.credit) || 0;   // 'credit' = funds available for new actions (buying power); bonusCredit excluded
+  return normalisePortfolio({ holdings, availableCashUsd: cash, totalPlUsd: n2(cp.unrealizedPnL), todayPlUsd: null });
 }
 function normalisePortfolio(p) {
   const holdings = (p.holdings || []).map(h => {
@@ -271,23 +310,21 @@ function normalisePortfolio(p) {
 }
 
 app.get('/api/portfolio', async (req, res) => {
-  if (!ETORO_KEY || !ETORO_URL) {
+  if (!ETORO_ON) {
     return res.json({
       source: 'manual', connected: false,
-      note: 'eToro read-only not configured. Set ETORO_API_KEY + ETORO_API_URL (read-only) to enable. Dashboard uses manual/last-known data.',
+      note: 'eToro read-only not configured. Set ETORO_API_KEY + ETORO_USER_KEY (read-only) to enable. Dashboard uses manual/last-known data.',
       portfolioValueUsd: null, availableCashUsd: null, todayPlUsd: null, totalPlUsd: null,
       holdings: [], allocationPercentages: {}, lastUpdated: null, ts: Date.now()
     });
   }
   try {
     const data = await cached('portfolio', 60000, async () => {
-      // READ-ONLY request. No trade/order/leverage scopes are ever sent.
-      const raw = await getJson(ETORO_URL, {
-        headers: { 'Authorization': 'Bearer ' + ETORO_KEY, 'X-Permissions': 'read-only', 'Accept': 'application/json' }
-      }, 12000);
-      return mapEtoro(raw);
+      // READ-ONLY request to eToro's PnL/portfolio endpoint. No order/trade endpoints are ever called.
+      const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
+      return mapEtoroPnl(raw);
     });
-    res.json({ ...data, source: 'etoro', connected: true, ts: Date.now() });
+    res.json({ ...data, source: 'etoro', connected: true, env: ETORO_ENV, ts: Date.now() });
   } catch (e) {
     res.json({
       source: 'manual', connected: false, error: String(e.message),
