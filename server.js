@@ -46,7 +46,7 @@ async function getJson(url, opts = {}, ms = 9000) {
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
     const r = await fetch(url, { ...opts, signal: ctrl.signal });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r.ok) { let b = ''; try { b = (await r.text()).slice(0, 200); } catch (_) {} throw new Error('HTTP ' + r.status + (b ? ' ' + b : '')); }
     return await r.json();
   } finally { clearTimeout(timer); }
 }
@@ -533,19 +533,24 @@ const GEO_ASK = '\n\nYou are NOT a market analyst and you do NOT give buy/sell/h
 // whether or not the 4 seats responded. NEVER receives portfolio holdings/history, only geoPacket.
 async function runGeoOfficer(geoPacket, verdict, ROLES) {
   if (!GROK_ON || typeof geoPacket !== 'string' || !geoPacket.trim()) return null;
+  let raw;
   try {
     const geoSystem = (ROLES.geopolitics || 'You are the committee\u2019s Geopolitical Risk Officer.') + GEO_ASK;
     const geoUser = 'MACRO / MARKET / NEWS CONTEXT (no portfolio data):\n' + geoPacket +
       '\n\nThe committee\u2019s current verdict: ' + (verdict || 'no verdict (committee unavailable this run)') +
       '.\nName the near-term global/geopolitical events that could make a deploy-or-wait decision wrong right now, and the one thing to watch.';
-    const g = parseJsonLoose(await callGrok(geoUser, geoSystem));
-    if (g) return {
-      summary: g.summary || '', events: Array.isArray(g.events) ? g.events.slice(0, 5) : [],
-      couldMakeWrong: g.couldMakeWrong || '', watch: g.watch || '',
-      by: 'grok', model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH
-    };
-  } catch (_) {}
-  return null;
+    raw = await callGrok(geoUser, geoSystem);
+  } catch (e) {
+    return { error: String((e && e.message) || e).slice(0, 220), by: 'grok', model: GROK_MODEL };
+  }
+  if (!raw) return { error: 'Grok returned an empty response — the xAI account may need an active payment method/credit before API calls work.', by: 'grok', model: GROK_MODEL };
+  const g = parseJsonLoose(raw);
+  if (!g) return { error: 'Grok replied but not in the expected JSON format.', note: String(raw).slice(0, 240), by: 'grok', model: GROK_MODEL };
+  return {
+    summary: g.summary || '', events: Array.isArray(g.events) ? g.events.slice(0, 5) : [],
+    couldMakeWrong: g.couldMakeWrong || '', watch: g.watch || '',
+    by: 'grok', model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH
+  };
 }
 
 app.post('/api/deep-triggers', async (req, res) => {
