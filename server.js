@@ -265,7 +265,7 @@ async function mapEtoroPnl(raw) {
     const id = p.instrumentId ?? p.instrumentID;
     if (id == null) return;
     const invested = n2(p.initialAmountInDollars ?? p.unitsBaseValueDollars ?? p.amount) || 0;
-    const pnl = n2(p.pnL ?? p.pnl) || 0;
+    const pnl = n2(p.unrealizedPnL ?? p.pnL ?? p.pnl ?? p.netProfit) || 0;
     const units = n2(p.units) || 0;
     const a = byId[id] || (byId[id] = { value: 0, units: 0, pl: 0 });
     a.value += invested + pnl; a.units += units; a.pl += pnl;
