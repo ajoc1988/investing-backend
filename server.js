@@ -529,6 +529,25 @@ const MODEL_ASK = '\n\nRespond ONLY with compact JSON, no markdown:\n{"verdict":
 const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","ifIHad1000":"<exact $ split totalling 1000, or WAIT FOR <event>>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
 const GEO_ASK = '\n\nYou are NOT a market analyst and you do NOT give buy/sell/hold advice. You never see the portfolio. Your ONLY job: name near-term (next 1\u20134 weeks) GLOBAL or GEOPOLITICAL events that could make the committee\u2019s verdict wrong \u2014 wars, sanctions, elections, oil/energy shocks, central-bank surprises, tariffs, major-power tensions.\n\nRespond ONLY with compact JSON, no markdown:\n{"summary":"<2 sentences on the geopolitical risk backdrop right now>","events":["<near-term event + date if known + why it matters to markets>","..."],"couldMakeWrong":"<the single scenario most likely to blindside the committee\u2019s verdict>","watch":"<the one headline or indicator to watch>"}';
 
+// Geopolitical Risk Officer (Grok). Runs independently of the committee — geopolitical risk exists
+// whether or not the 4 seats responded. NEVER receives portfolio holdings/history, only geoPacket.
+async function runGeoOfficer(geoPacket, verdict, ROLES) {
+  if (!GROK_ON || typeof geoPacket !== 'string' || !geoPacket.trim()) return null;
+  try {
+    const geoSystem = (ROLES.geopolitics || 'You are the committee\u2019s Geopolitical Risk Officer.') + GEO_ASK;
+    const geoUser = 'MACRO / MARKET / NEWS CONTEXT (no portfolio data):\n' + geoPacket +
+      '\n\nThe committee\u2019s current verdict: ' + (verdict || 'no verdict (committee unavailable this run)') +
+      '.\nName the near-term global/geopolitical events that could make a deploy-or-wait decision wrong right now, and the one thing to watch.';
+    const g = parseJsonLoose(await callGrok(geoUser, geoSystem));
+    if (g) return {
+      summary: g.summary || '', events: Array.isArray(g.events) ? g.events.slice(0, 5) : [],
+      couldMakeWrong: g.couldMakeWrong || '', watch: g.watch || '',
+      by: 'grok', model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH
+    };
+  } catch (_) {}
+  return null;
+}
+
 app.post('/api/deep-triggers', async (req, res) => {
   const packet = req.body && req.body.packet;
   if (!packet || typeof packet !== 'string') return res.status(400).json({ error: 'missing packet' });
@@ -571,7 +590,12 @@ app.post('/api/deep-triggers', async (req, res) => {
     };
   }));
   let models = r1.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
-  if (!models.length) return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No AI models responded. Add OPENROUTER_API_KEY and/or GEMINI_API_KEY, or check the model IDs in COMMITTEE_SEATS.', ifIHad1000: null, idiotGuide: null, synthesised: false, ts: Date.now() });
+  if (!models.length) {
+    // Committee unavailable (e.g. all free seats rate-limited), but the Geopolitical Risk Officer is
+    // independent and on a separate provider — still run it so the user gets the external-risk read.
+    const geoRisk = await runGeoOfficer(req.body && req.body.geoPacket, null, ROLES);
+    return res.json({ models: [], consensus: 0, verdict: null, agree: [], disagree: [], strongestArgument: '', weakestAssumption: '', risk: 'No committee models responded (often the free-tier daily limit). Add OPENROUTER_API_KEY and/or GEMINI_API_KEY, or wait for the quota to reset.', ifIHad1000: null, idiotGuide: null, synthesised: false, seatsConfigured: seats.length, seatsResponded: 0, seatStatus: seats.map(s => ({ seat: s.seat, role: roleLabel(s.role), provider: s.provider, model: s.model, isDevil: s.role === 'devil', status: 'failed', verdict: null, independentVerdict: null })), tally: {}, geoRisk, ts: Date.now() });
+  }
 
   // ROUND 2 — rebuttal. Each seat sees the others' round-1 arguments and challenges the weakest.
   // The Devil's Advocate is told explicitly to attack the consensus. Best-effort: a failed rebuttal keeps the round-1 view.
@@ -649,26 +673,8 @@ app.post('/api/deep-triggers', async (req, res) => {
     ts: Date.now()
   };
 
-  // GEOPOLITICAL RISK OFFICER (Grok) — runs SEPARATELY from the voting committee and is NOT in the tally.
-  // One job: what global event could make this verdict wrong? It NEVER receives portfolio holdings or
-  // history — only the macro/market/news context the dashboard sends as geoPacket. Best-effort, never blocks.
-  let geoRisk = null;
-  const geoPacket = req.body && req.body.geoPacket;
-  if (GROK_ON && typeof geoPacket === 'string' && geoPacket.trim()) {
-    try {
-      const geoSystem = (ROLES.geopolitics || 'You are the committee\u2019s Geopolitical Risk Officer.') + GEO_ASK;
-      const geoUser = 'MACRO / MARKET / NEWS CONTEXT (no portfolio data):\n' + geoPacket +
-        '\n\nThe investment committee just reached this verdict: ' + (verdict || 'n/a') +
-        '.\nName the near-term global/geopolitical events that could make that verdict wrong, and the one thing to watch.';
-      const g = parseJsonLoose(await callGrok(geoUser, geoSystem));
-      if (g) geoRisk = {
-        summary: g.summary || '', events: Array.isArray(g.events) ? g.events.slice(0, 5) : [],
-        couldMakeWrong: g.couldMakeWrong || '', watch: g.watch || '',
-        by: 'grok', model: GROK_MODEL, liveSearch: GROK_LIVE_SEARCH
-      };
-    } catch (_) { geoRisk = null; }
-  }
-  out.geoRisk = geoRisk;
+  // GEOPOLITICAL RISK OFFICER (Grok) — separate from the voting committee, not in the tally.
+  out.geoRisk = await runGeoOfficer(req.body && req.body.geoPacket, verdict, ROLES);
   res.json(out);
 
   // History — log this run server-side for the long-term dataset (per-seat verdicts + full synthesis + packet).
