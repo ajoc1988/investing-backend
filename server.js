@@ -319,6 +319,21 @@ app.get('/api/portfolio', async (req, res) => {
     });
   }
   try {
+    if (req.query.debug === '1') {
+      // Diagnostic: returns FIELD NAMES ONLY (no amounts) so we can map P/L exactly. Remove after.
+      const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
+      const cp = (raw && (raw.clientPortfolio || raw)) || {};
+      const positions = Array.isArray(cp.positions) ? cp.positions : [];
+      const m0 = cp.mirrors && cp.mirrors[0] && Array.isArray(cp.mirrors[0].positions) ? cp.mirrors[0].positions[0] : null;
+      return res.json({
+        debug: true,
+        positionCount: positions.length,
+        mirrorsCount: Array.isArray(cp.mirrors) ? cp.mirrors.length : 0,
+        portfolioKeys: Object.keys(cp),
+        positionKeys: positions[0] ? Object.keys(positions[0]) : [],
+        mirrorPositionKeys: m0 ? Object.keys(m0) : []
+      });
+    }
     const data = await cached('portfolio', 60000, async () => {
       // READ-ONLY request to eToro's PnL/portfolio endpoint. No order/trade endpoints are ever called.
       const raw = await getJson(`${ETORO_BASE}/api/v1/trading/info/${ETORO_ENV}/pnl`, { headers: etoroHeaders() }, 15000);
