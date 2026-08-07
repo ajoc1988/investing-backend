@@ -7,19 +7,27 @@
  * upstream returns null for that field instead of crashing the response.
  *
  * Endpoints
- *   GET  /api/health
+ *   GET  /api/health          -> ok, version (build id), key/seat availability
  *   GET  /api/prices?symbols=VOO,QQQ,NVDA,MSFT,VXUS,SCHD
  *   GET  /api/market          -> spx, ndx, vix, y2, y10, dxy
  *   GET  /api/macro           -> cpi, cpiPrev, fedRate, cutProb, fg, breadth
  *   GET  /api/events          -> upcoming CPI/PPI/Jobs/Fed + NVDA/MSFT earnings
  *   GET  /api/news            -> market headlines
- *   POST /api/deep-triggers   -> { packet } => AI consensus, verdict, risk, $1000, idiot guide
+ *   POST /api/deep-triggers   -> { packet, cashContext, fresh? } => AI consensus, verdict, risk
+ *                                (25-minute result cache; see DEEP_CACHE below)
  */
 
 try { require('dotenv').config(); } catch (_) { /* dotenv optional: hosted platforms inject env vars directly */ }
 const express = require('express');
 const cors = require('cors');
 const { resolve: resolveCommitteeAction } = require('./committee-resolver');
+
+/* ── BUILD IDENTIFICATION (V2 §3.1) ────────────────────────────────────────────
+ * Explicit constant, deliberately NOT derived from package.json (Ruling 6). Bump this
+ * by hand whenever the backend is deployed. Surfaced via /api/health so the frontend
+ * can compare it against its own constant and flag frontend/backend deployment drift.
+ * The frontend expects API_VERSION to match its EXPECTED_API constant.               */
+const API_VERSION = '2.0.0';
 
 const app = express();
 app.use(express.json({ limit: '128kb' }));
@@ -93,6 +101,7 @@ async function fredLatest(series) {
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
+    version: API_VERSION,
     keys: {
       etoro: ETORO_ON, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
       openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY,
@@ -411,7 +420,7 @@ const DEFENSIVE_VERDICTS = ['WATCH', 'HOLD', 'WAIT', 'REDUCE RISK'];
 function coerceDefensive(v) { return DEFENSIVE_VERDICTS.includes(v) ? v : 'WAIT'; }
 // Shared rubric so every seat (and the chair) uses the ladder the same way.
 const VERDICT_GUIDE = '\n\nVERDICT LADDER (use these exact words):\n' +
-  '- DEPLOY ON PLAN: routine — put excess cash to work in underweight core holdings to hit existing targets. This is maintenance, not aggression.\n' +
+  '- DEPLOY ON PLAN: routine — proceed with the written Investment Policy as scheduled. This is maintenance, not aggression.\n' +
   '- BUY GRADUALLY: ease in over several tranches rather than all at once.\n' +
   '- WATCH: conditions mixed; prepare but wait for a specific trigger.\n' +
   '- HOLD: do nothing; stay the course.\n' +
@@ -421,10 +430,13 @@ const VERDICT_GUIDE = '\n\nVERDICT LADDER (use these exact words):\n' +
 
 // Built-in fallbacks used only if a prompt file is missing.
 const DEFAULTS = {
-  'system-investing.md': 'You advise Andrew Collins, a long-term eToro ETF/stock investor in Bahrain. Advice only — never place trades, never suggest leverage/CFDs/options/shorting/crypto. Scope: portfolio, markets, dry powder, deployment, risk, opportunity. Be blunt and decision-led.',
-  'deep-triggers.md': 'From your role, give a blunt independent read of the portfolio, market, the biggest risk, the best opportunity, and whether to deploy today and where. End with ONE verdict.',
+  'system-investing.md': 'You advise Andrew Collins, a long-term eToro ETF/stock investor in Bahrain. Advice only — never place trades, never suggest leverage/CFDs/options/shorting/crypto. '
+    + 'His written Investment Policy is the primary authority: Monthly Plan = BHD500 into ISAC.L, ON POLICY. There are NO target allocation percentages; current composition is DESCRIPTIVE only. '
+    + 'Never recommend a rebalance, a target allocation, or redirecting the Monthly Plan because weights differ. Your role is to identify genuine EXCEPTIONS to the policy, not to design a better portfolio. '
+    + 'Treasury Bills and Savings are ring-fenced and non-deployable — never treat them as available capital. Be blunt and decision-led.',
+  'deep-triggers.md': 'From your role, give a blunt independent read of the current position, market, the biggest risk, the best opportunity, and whether conditions justify an exception to the written Investment Policy today. Do not propose a target allocation or a rebalance. End with ONE verdict.',
   roles: {
-    pm: 'Portfolio Manager. Focus on allocation, deployment of dry powder, hitting target weights, and long-term compounding. Pragmatic, action-oriented.',
+    pm: 'Portfolio Manager. Focus on whether the written Investment Policy should proceed as scheduled, sizing of any discretionary deployment, and long-term compounding. There are no target weights to hit \\u2014 do not propose a target allocation or a rebalance. Pragmatic, action-oriented.',
     risk: 'Risk Manager. Assess portfolio-specific risk: concentration (single names like NVDA/AIA), diversification, drawdown capacity and position sizing. Constructive but cautious.',
     macro: 'Macro Analyst. Read the VIX, yields, the yield curve, CPI and the Fed, plus any headlines/catalysts in the packet. Judge the regime and whether conditions favour deploying or waiting.',
     news: 'News / Research Analyst. Weigh the headlines and catalysts in the packet. Separate signal from noise; flag anything that genuinely changes the picture.',
@@ -657,7 +669,7 @@ function buildMemory(runs, journal) {
 }
 
 const MODEL_ASK = '\n\nRespond ONLY with compact JSON, no markdown:\n{"verdict":"<one of: ' + VERDICTS.join(' | ') + '>","keyArgument":"<your single strongest point>","weakestAssumption":"<the weakest assumption in the optimistic case>","risk":"<the biggest risk being ignored>","deploy":"<exact $ split for new cash today, or WAIT FOR <event>>","reasoning":"<2-3 blunt sentences>"}';
-const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","ifIHad1000":"<exact $ split totalling 1000, or WAIT FOR <event>>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
+const SYNTH_ASK = '\n\nYou MUST judge which argument is strongest. DO NOT average the verdicts and DO NOT just take the majority. Decide.\n\nRespond ONLY with compact JSON, no markdown:\n{"finalVerdict":"<one of: ' + VERDICTS.join(' | ') + '>","agree":["<points all/most models agree on>"],"disagree":["<genuine points of disagreement>"],"strongestArgument":"<which view is strongest and why>","weakestAssumption":"<the weakest assumption anyone is relying on>","riskWarning":"<one blunt sentence>","idiotGuide":{"do":["..."],"dont":["..."],"checkAgain":"..."}}';
 const GEO_ASK = '\n\nYou are NOT a market analyst and you do NOT give buy/sell/hold advice. You never see the portfolio. Your ONLY job: name near-term (next 1\u20134 weeks) GLOBAL or GEOPOLITICAL events that could make the committee\u2019s verdict wrong \u2014 wars, sanctions, elections, oil/energy shocks, central-bank surprises, tariffs, major-power tensions.\n\nRespond ONLY with compact JSON, no markdown:\n{"summary":"<2 sentences on the geopolitical risk backdrop right now>","events":["<near-term event + date if known + why it matters to markets>","..."],"couldMakeWrong":"<the single scenario most likely to blindside the committee\u2019s verdict>","watch":"<the one headline or indicator to watch>"}';
 
 // Dedicated Geopolitical Risk Officer brief. Same underlying model as a committee seat can use, but a
@@ -706,14 +718,84 @@ async function runGeoOfficer(geoPacket, verdict, ROLES) {
   };
 }
 
+/* ── DEEP TRIGGERS RESULT CACHE (V2 §3.8, Ruling 5) ────────────────────────────
+ * Purpose: protect free-tier provider quota across page reloads and devices. That is
+ * why it lives here and not in the browser — a frontend cache dies on refresh.
+ *
+ * TTL 25 minutes. VISIBLE, never silent: every served hit carries cached/cachedAt/ageMs
+ * so the frontend can say "Using analysis from 8 minutes ago" and offer a fresh run.
+ *
+ * Key = hash(normalised packet) + bucket + seat fingerprint.
+ *   - The packet's first line is a fresh ISO timestamp on every build, so hashing it raw
+ *     would give a 0% hit rate — a cache that looks like it works and silently does
+ *     nothing. NORM_PACKET strips volatile lines before hashing.
+ *   - Bucket is mandatory: the resolver returns DIFFERENT actions for the same verdict
+ *     depending on bucket, so a Monthly Plan run must never be replayed for Broker Cash
+ *     or the Opportunity Reserve.
+ *   - Seat fingerprint: if the seat/model configuration changes, past results don't apply.
+ *
+ * NEVER caches a failed or empty run. A quota-exhausted "no seats responded" result must
+ * not be served for 25 minutes dressed up as analysis — that is the opposite of the point,
+ * and an honest "no verdict" has to stay honest.
+ *
+ * In-memory by design. Render free instances sleep, so this is opportunistic, not
+ * guaranteed: a cold start empties it. It still solves repeated runs within a session.  */
+const DEEP_TTL_MS = 25 * 60 * 1000;
+const DEEP_CACHE = new Map();
+
+function normPacket(p) {
+  return String(p)
+    .split('\n')
+    .filter(l => !/^MARKET BRIEFING PACKET/i.test(l))   // volatile: carries a fresh ISO timestamp
+    .join('\n')
+    .trim();
+}
+function deepCacheKey(packet, cashContext, seats) {
+  const bucket = (cashContext && cashContext.bucket) || 'none';
+  const seatFp = seats.map(x => x.seat + ':' + x.provider + ':' + x.model).sort().join('|');
+  return crypto.createHash('sha256')
+    .update(normPacket(packet) + '\u0000' + bucket + '\u0000' + seatFp)
+    .digest('hex');
+}
+function deepCacheGet(key) {
+  const hit = DEEP_CACHE.get(key);
+  if (!hit) return null;
+  const age = Date.now() - hit.ts;
+  if (age > DEEP_TTL_MS) { DEEP_CACHE.delete(key); return null; }
+  return { data: hit.data, ageMs: age, cachedAt: hit.ts };
+}
+function deepCacheSet(key, data) {
+  // Refuse to cache a degraded run — an empty committee is not a result worth replaying.
+  if (!data || !Array.isArray(data.models) || !data.models.length) return false;
+  if (data.seatsResponded === 0) return false;
+  DEEP_CACHE.set(key, { ts: Date.now(), data });
+  if (DEEP_CACHE.size > 40) {           // cheap sweep: drop anything already expired
+    const now = Date.now();
+    for (const [k, v] of DEEP_CACHE) if (now - v.ts > DEEP_TTL_MS) DEEP_CACHE.delete(k);
+  }
+  return true;
+}
+
 app.post('/api/deep-triggers', async (req, res) => {
   const packet = req.body && req.body.packet;
   const cashContext = (req.body && req.body.cashContext) || null; // {bucket:'plan'|'discretionary'|'drypowder', amount?, monthlyLimit?}; ring-fenced cash is never sent
+  const forceFresh = !!(req.body && req.body.fresh);
   if (!packet || typeof packet !== 'string') return res.status(400).json({ error: 'missing packet' });
 
   const TASK = loadPrompt('deep-triggers.md');
   const ROLES = loadRoles();
   const seats = loadSeats().filter(s => providerHasKey(s.provider));
+
+  // Cache lookup happens AFTER seats are known so the key reflects the live seat config.
+  const CACHE_KEY = deepCacheKey(packet, cashContext, seats);
+  if (!forceFresh) {
+    const hit = deepCacheGet(CACHE_KEY);
+    if (hit) {
+      return res.json(Object.assign({}, hit.data, {
+        cached: true, cachedAt: hit.cachedAt, ageMs: hit.ageMs, ttlMs: DEEP_TTL_MS
+      }));
+    }
+  }
 
   // Committee memory — feed the committee its own recent track record so it can self-critique
   // (repeating the same call? was advice acted on? did past calls look right?). Best-effort.
@@ -834,7 +916,11 @@ app.post('/api/deep-triggers', async (req, res) => {
     strongestArgument: (synth && synth.strongestArgument) || '',
     weakestAssumption: (synth && synth.weakestAssumption) || models.map(m => m.weakestAssumption).filter(Boolean)[0] || '',
     risk: (synth && synth.riskWarning) || models.map(m => m.risk).filter(Boolean)[0] || '',
-    ifIHad1000: (synth && synth.ifIHad1000) || models.map(m => m.deploy).filter(Boolean)[0] || null,
+    // V2 (Ruling 3): ifIHad1000 is RETIRED. The chair is no longer asked for a dollar split,
+    // and none is derived from seat commentary. The Monthly Plan destination is set by written
+    // policy; a second allocation engine competing with the resolved action is the exact
+    // single-authority violation V2 exists to remove. Always null.
+    ifIHad1000: null,
     idiotGuide: (synth && synth.idiotGuide) || null,
     synthesised: !!synth, synthBy: synthModel ? synthModel.provider : null,
     rounds: DEBATE_ROUNDS, seats: models.length,
@@ -846,9 +932,13 @@ app.post('/api/deep-triggers', async (req, res) => {
   try { out.resolution = resolveCommitteeAction({ verdict: out.verdict, consensus: out.consensus, seatsResponded: out.seatsResponded, seatsConfigured: out.seatsConfigured, cashContext }); }
   catch (e) { out.resolution = { error: String(e.message) }; }
 
-  // GEOPOLITICAL RISK OFFICER (Grok) — separate from the voting committee, not in the tally.
+  // GEOPOLITICAL RISK OFFICER (Gemini, with Google Search grounding) — separate from the
+  // voting committee, not in the tally. NOTE: not Grok/xAI; xAI is not a production dependency.
   out.geoRisk = await runGeoOfficer(req.body && req.body.geoPacket, verdict, ROLES);
-  res.json(out);
+
+  // Cache the completed run (no-op for degraded/empty runs — see deepCacheSet).
+  deepCacheSet(CACHE_KEY, out);
+  res.json(Object.assign({}, out, { cached: false, cachedAt: Date.now(), ageMs: 0, ttlMs: DEEP_TTL_MS }));
 
   // History — log this run server-side for the long-term dataset (per-seat verdicts + full synthesis + packet).
   // Fire-and-forget: never blocks or crashes the response. This is the long-term performance goldmine.
@@ -873,7 +963,10 @@ app.post('/api/deep-triggers', async (req, res) => {
  * Read-only and advisory: it never trades, and the user approves every action himself. */
 const CHAT_SYS = 'You are the assistant built into Andrew\u2019s personal Investing Command Centre. ' +
   'You help him think through his own portfolio and general finance questions \u2014 comparisons, trade-offs, education, sanity-checks. ' +
-  'Treat the LIVE SNAPSHOT below as the ground truth for his current holdings, cash, targets, scores and latest committee verdict. ' +
+  'Treat the LIVE SNAPSHOT below as the ground truth for his current holdings, cash, scores and latest committee verdict. ' +
+  'His written Investment Policy is authoritative: Monthly Plan = BHD500 into ISAC.L, ON POLICY. There are no target allocation percentages \u2014 ' +
+  'current composition is descriptive only. Never recommend rebalancing or redirecting the Monthly Plan because weights differ from some target. ' +
+  'Treasury Bills and Savings are ring-fenced and non-deployable; never treat them as available capital. ' +
   'Be concise and direct. Give analysis and options; never instruct him to execute \u2014 he approves every trade himself on eToro and you cannot trade. ' +
   'Do not invent prices or figures not in the snapshot or general knowledge; if something isn\u2019t there, say so plainly. ' +
   'You are not a licensed financial adviser; frame conclusions as his decision to make.';
