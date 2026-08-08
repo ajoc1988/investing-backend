@@ -31,7 +31,15 @@ const API_VERSION = '2.0.0';
 
 const app = express();
 app.use(express.json({ limit: '128kb' }));
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+/* CORS (step 6). Now accepts a comma-separated list, e.g.
+ *   CORS_ORIGIN=https://ajoc1988.github.io
+ * DEFAULT IS STILL '*' AND THAT IS DELIBERATE — see the deployment notes. Restricting it
+ * would break opening the dashboard as a local file (file:// sends `Origin: null`), which
+ * the owner does when testing. CORS constrains browsers only and does nothing against a
+ * script or curl, so this is tidiness rather than a control; authentication is what
+ * actually protects these routes. Owner's call, not a silent default change. */
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+app.use(cors({ origin: CORS_ORIGIN === '*' ? '*' : CORS_ORIGIN.split(',').map(x => x.trim()).filter(Boolean) }));
 
 const PORT = process.env.PORT || 8787;
 const FINNHUB = process.env.FINNHUB_API_KEY || '';
@@ -68,18 +76,36 @@ async function cached(key, ttlMs, fn) {
   if (hit && hit.exp > Date.now()) return hit.data;
   const data = await fn();
   cache.set(key, { data, exp: Date.now() + ttlMs });
+  // Nothing ever evicted from this Map before (step 5). Sweep expired entries once it grows.
+  if (cache.size > 400) { const now = Date.now(); for (const [k, v] of cache) if (v.exp < now) cache.delete(k); }
   return data;
 }
 
-// very light per-IP rate limit (protects your keys from a runaway client)
+/* ── Client IP behind Render's proxy (step 4) ───────────────────────────────────
+ * Express defaults to trust proxy = false, which made req.ip the address of Render's
+ * edge proxy rather than the visitor — meaning every client on earth shared ONE rate
+ * limit bucket, so an attacker draining the API would also lock the owner out.
+ * Render puts exactly one proxy in front of the service, hence 1.
+ * Set TRUST_PROXY=0 to disable if that ever changes. Verify with the authenticated
+ * /api/health payload, which reports the observed ip and X-Forwarded-For chain —
+ * deliberately NOT a public debug endpoint. */
+app.set('trust proxy', process.env.TRUST_PROXY != null ? (isNaN(+process.env.TRUST_PROXY) ? process.env.TRUST_PROXY : +process.env.TRUST_PROXY) : 1);
+
+/* Opportunistic per-IP limit. Lowered from 120/min: at 120 an attacker was allowed
+ * 172,800 committee runs a day, each costing 10-29 upstream AI calls. This is now a
+ * backstop against a runaway client, NOT the quota protection — authentication is
+ * what stops quota drain, and the durable daily cap below is what bounds the cost of
+ * a stolen token. Entries are pruned; the original Map grew without limit. */
 const hits = new Map();
+const RATE_MAX = Math.max(10, +process.env.RATE_MAX || 40);
 app.use((req, res, next) => {
   const ip = req.ip || 'x';
   const now = Date.now();
+  if (hits.size > 5000) { for (const [k, v] of hits) if (v.exp < now) hits.delete(k); }
   const w = hits.get(ip) || { n: 0, exp: now + 60000 };
   if (w.exp < now) { w.n = 0; w.exp = now + 60000; }
   w.n++; hits.set(ip, w);
-  if (w.n > 120) return res.status(429).json({ error: 'rate_limited' });
+  if (w.n > RATE_MAX) return res.status(429).json({ error: 'rate_limited' });
   next();
 });
 
@@ -211,6 +237,24 @@ app.use((req, res, next) => {
 });
 /* ══════════════════════════════════════════════════════════════════════════════ */
 
+
+/* ── ERROR SURFACES (step 3) ────────────────────────────────────────────────────
+ * Split by route class, per owner ruling.
+ *   PUBLIC routes  -> fixed generic strings. These are the routes whose upstream calls
+ *                     carry FRED_API_KEY / FINNHUB_API_KEY in the URL QUERY STRING, and
+ *                     the caller could be anyone. If an upstream ever echoes the request
+ *                     URL inside its error body, the old code would have relayed it.
+ *   AUTHENTICATED  -> classified, not dumped. The only reader is the owner, and the
+ *                     classification preserves the diagnostic that actually matters
+ *                     ("rate-limited / daily quota") without the provider's raw text.
+ * Everything raw goes to console.error, i.e. the Render log, which only the owner sees.
+ * Before this change there was no logging at all in this file beyond the startup line. */
+function logUpstream(where, e) {
+  try { console.error('[' + where + ']', String((e && e.message) || e).slice(0, 400)); } catch (_) {}
+}
+// Public-facing: never varies with upstream text.
+function publicErr(where, e) { logUpstream(where, e); return 'upstream data source unavailable'; }
+
 /* ───────── FRED helpers ───────── */
 async function fredObs(series, limit = 1) {
   if (!FRED) return [];
@@ -227,9 +271,19 @@ async function fredLatest(series) {
 
 /* ───────── /api/health ───────── */
 app.get('/api/health', (req, res) => {
+  /* PUBLIC payload is deliberately minimal. The frontend needs this before sign-in for the
+   * build chip and the "backend reachable" check, so it stays open — but the provider
+   * enumeration below is a targeting aid (it tells an attacker which quota is worth
+   * draining) with no value to a logged-out page. Full detail requires a valid token. */
+  const h = req.headers.authorization || '';
+  const authed = !!verifyToken(h.startsWith('Bearer ') ? h.slice(7).trim() : '');
+  if (!authed) return res.json({ ok: true, version: API_VERSION, ts: Date.now() });
   res.json({
     ok: true,
     version: API_VERSION,
+    /* Observed client address, so the TRUST_PROXY setting can be verified without a
+     * public debug endpoint (owner ruling 9). Authenticated-only. */
+    client: { ip: req.ip, xff: req.headers['x-forwarded-for'] || null, trustProxy: app.get('trust proxy') },
     keys: {
       etoro: ETORO_ON, finnhub: !!FINNHUB, fred: !!FRED, supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
       openai: !!process.env.OPENAI_API_KEY, anthropic: !!process.env.ANTHROPIC_API_KEY,
@@ -237,7 +291,12 @@ app.get('/api/health', (req, res) => {
       openrouter: !!process.env.OPENROUTER_API_KEY, groq: !!process.env.GROQ_API_KEY, grok: GROK_ON
     },
     committeeSeats: loadSeats().filter(s => providerHasKey(s.provider)).length,
-    geoOfficer: (process.env.GEMINI_API_KEY) ? { on: true, model: process.env.GEO_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash', by: 'gemini' } : { on: false },
+    /* FIXED: this used to report `GEO_MODEL || GEMINI_MODEL || 'gemini-2.5-flash'`, but
+     * runGeoOfficer() actually calls the GEO_MODEL constant, which falls back to a different
+     * default and ignores GEMINI_MODEL entirely. With GEMINI_MODEL set and GEO_MODEL unset
+     * the two genuinely disagreed, so the dashboard reported a model that was not the one
+     * doing the work. Report the constant that is actually used. */
+    geoOfficer: (process.env.GEMINI_API_KEY) ? { on: true, model: GEO_MODEL, by: 'gemini' } : { on: false },
     ts: Date.now()
   });
 });
@@ -245,7 +304,11 @@ app.get('/api/health', (req, res) => {
 /* ───────── /api/prices ───────── */
 app.get('/api/prices', async (req, res) => {
   const symbols = String(req.query.symbols || 'VOO,QQQ,NVDA,MSFT,VXUS,SCHD')
-    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 25);
+    .split(',').map(s => s.trim().toUpperCase()).filter(s => /^[A-Z0-9.\-]{1,12}$/.test(s))
+    .filter((v, i, a) => a.indexOf(v) === i).sort().slice(0, 25);
+  /* Sorted + de-duplicated + shape-validated (step 5). The cache key is built from this list,
+   * so previously VOO,QQQ and QQQ,VOO were two entries and arbitrary junk symbols could mint
+   * unlimited ones. Normalising collapses the permutations; the regex rejects the junk. */
   try {
     const data = await cached('prices:' + symbols.join(','), 30000, async () => {
       const out = {};
@@ -259,7 +322,7 @@ app.get('/api/prices', async (req, res) => {
       return { prices: out, source: 'finnhub' };
     });
     res.json({ ...data, ts: Date.now() });
-  } catch (e) { res.json({ prices: {}, source: 'error', error: String(e.message), ts: Date.now() }); }
+  } catch (e) { res.json({ prices: {}, source: 'error', error: publicErr('prices', e), ts: Date.now() }); }
 });
 
 /* ───────── /api/market ───────── */
@@ -277,7 +340,7 @@ app.get('/api/market', async (req, res) => {
       return { spx, ndx, vix, y2, y10, dxy, source: FRED ? 'fred' : 'none' };
     });
     res.json({ ...data, note: 'FRED values are daily close (may lag intraday).', ts: Date.now() });
-  } catch (e) { res.json({ error: String(e.message), ts: Date.now() }); }
+  } catch (e) { res.json({ error: publicErr('market', e), ts: Date.now() }); }
 });
 
 /* ───────── /api/macro ───────── */
@@ -318,7 +381,7 @@ app.get('/api/macro', async (req, res) => {
       };
     });
     res.json({ ...data, ts: Date.now() });
-  } catch (e) { res.json({ error: String(e.message), ts: Date.now() }); }
+  } catch (e) { res.json({ error: publicErr('macro', e), ts: Date.now() }); }
 });
 
 /* ───────── /api/events ───────── */
@@ -349,7 +412,7 @@ app.get('/api/events', async (req, res) => {
       return { events, source: FINNHUB ? 'finnhub-earnings' : 'config', note: 'Macro release dates need manual entry (no free economic calendar).' };
     });
     res.json({ ...data, ts: Date.now() });
-  } catch (e) { res.json({ events: [], error: String(e.message), ts: Date.now() }); }
+  } catch (e) { res.json({ events: [], error: publicErr('events', e), ts: Date.now() }); }
 });
 
 /* ───────── /api/news ───────── */
@@ -365,7 +428,7 @@ app.get('/api/news', async (req, res) => {
       return { news, source: 'finnhub' };
     });
     res.json({ ...data, ts: Date.now() });
-  } catch (e) { res.json({ news: [], error: String(e.message), ts: Date.now() }); }
+  } catch (e) { res.json({ news: [], error: publicErr('news', e), ts: Date.now() }); }
 });
 
 /* ───────── /api/portfolio (eToro READ-ONLY stub) ─────────
@@ -530,7 +593,7 @@ app.get('/api/portfolio', async (req, res) => {
     res.json({ ...data, source: 'etoro', connected: true, env: ETORO_ENV, ts: Date.now() });
   } catch (e) {
     res.json({
-      source: 'manual', connected: false, error: String(e.message),
+      source: 'manual', connected: false, error: (logUpstream('portfolio', e), shortReason(String((e && e.message) || e))),
       note: 'eToro sync unavailable — using manual/last known data.',
       holdings: [], allocationPercentages: {}, ts: Date.now()
     });
@@ -574,16 +637,18 @@ const DEFAULTS = {
   }
 };
 const _pcache = {};
+const _psource = {};   // step 7: 'file' when an override exists on disk, 'default' when built-in
 function loadPrompt(file) {
   try {
     const fp = path.join(PROMPT_DIR, file);
     const st = fs.statSync(fp);
     const c = _pcache[file];
-    if (c && c.mt === st.mtimeMs) return c.data;          // serve cached unless the file changed
+    if (c && c.mt === st.mtimeMs) { _psource[file] = 'file'; return c.data; }   // serve cached unless the file changed
     const txt = fs.readFileSync(fp, 'utf8');
     _pcache[file] = { mt: st.mtimeMs, data: txt };
+    _psource[file] = 'file';
     return txt;
-  } catch (_) { return DEFAULTS[file] || ''; }
+  } catch (_) { _psource[file] = 'default'; return DEFAULTS[file] || ''; }
 }
 function loadRoles() {
   const txt = loadPrompt('ai-roles.json');
@@ -715,6 +780,7 @@ async function callSeatModel(provider, model, user, system) {
     if (c) return { ok: true, content: c };
     return { ok: false, error: providerHasKey(provider) ? 'empty response' : 'no API key' };
   } catch (e) {
+    logUpstream('seat:' + provider + ':' + model, e);
     return { ok: false, error: String((e && e.message) || e).slice(0, 160) };
   }
 }
@@ -747,7 +813,10 @@ function shortReason(r) {
   if (/empty response/i.test(r)) return 'empty reply';
   if (/no API key/i.test(r)) return 'no API key';
   if (/5\d\d/.test(r)) return 'provider error (5xx)';
-  return r.slice(0, 70);
+  // Was: return r.slice(0, 70) — a raw dump of upstream text. Classify instead; the full
+  // string is in the Render log. "provider quota exceeded" is the diagnostic that matters
+  // and it is preserved above; this branch only catches genuinely novel failures.
+  return 'provider error (unclassified \u2014 see server log)';
 }
 
 // Committee seats — genuine diversity = different model FAMILIES + different roles.
@@ -833,7 +902,11 @@ async function runGeoOfficer(geoPacket, verdict, ROLES) {
       const last = i === delays.length - 1;
       if (!last && geoIsTransient(msg)) continue;
       const tries = i + 1;
-      return { error: msg.slice(0, 200) + (tries > 1 ? ' (after ' + tries + ' attempts)' : ''), by: 'gemini', model: GEO_MODEL, attempts: tries };
+      logUpstream('geo', msg);
+      // Classified, not dumped (step 3). This is the path that produces the visible
+      // "quota exhausted" signal, so it must stay informative — shortReason maps both
+      // 429 and the word "quota" to 'rate-limited / daily quota'.
+      return { error: shortReason(msg) + (tries > 1 ? ' (after ' + tries + ' attempts)' : ''), by: 'gemini', model: GEO_MODEL, attempts: tries };
     }
   }
   if (!raw) return { error: 'Geopolitical Officer (Gemini) returned an empty response.', by: 'gemini', model: GEO_MODEL };
@@ -925,6 +998,11 @@ app.post('/api/deep-triggers', async (req, res) => {
     }
   }
 
+  // Daily cap is checked only once a cache miss is certain: a served cache hit makes no
+  // upstream call, so charging it against the allowance would be wrong.
+  const capDT = await bumpUsage('deep-triggers');
+  if (!capDT.allowed) return res.status(429).json({ error: 'daily_limit_reached', used: capDT.used, cap: capDT.cap, note: 'Daily Deep Triggers allowance reached. It resets at midnight UTC.' });
+
   // Committee memory — feed the committee its own recent track record so it can self-critique
   // (repeating the same call? was advice acted on? did past calls look right?). Best-effort.
   let MEMORY = '';
@@ -972,7 +1050,9 @@ app.post('/api/deep-triggers', async (req, res) => {
       providerUsed: m ? (m.providerUsed || s.provider) : null,
       usedFallback: m ? !!m.usedFallback : false,
       verdict: m ? m.verdict : null, independentVerdict: m ? m.independentVerdict : null,
-      reason: m ? null : shortReason(failures[s.seat]), reasonDetail: m ? null : (failures[s.seat] || null)
+      // reasonDetail (raw upstream body) REMOVED step 3 — `reason` above is the classified
+      // form and carries the same signal. Raw text goes to the Render log only.
+      reason: m ? null : shortReason(failures[s.seat])
     };
   });
   if (!models.length) {
@@ -1058,7 +1138,9 @@ app.post('/api/deep-triggers', async (req, res) => {
 
   // Post-synthesis resolution: honest colour + bucket-aware action. Does NOT change the verdict.
   try { out.resolution = resolveCommitteeAction({ verdict: out.verdict, consensus: out.consensus, seatsResponded: out.seatsResponded, seatsConfigured: out.seatsConfigured, cashContext }); }
-  catch (e) { out.resolution = { error: String(e.message) }; }
+  // Our own resolver, not an upstream provider — the message is safe and diagnostic
+  // (committee-resolver throws on unknown bucket names). Logged as well as returned.
+  catch (e) { logUpstream('resolver', e); out.resolution = { error: String(e.message) }; }
 
   // GEOPOLITICAL RISK OFFICER (Gemini, with Google Search grounding) — separate from the
   // voting committee, not in the tally. NOTE: not Grok/xAI; xAI is not a production dependency.
@@ -1109,20 +1191,29 @@ app.post('/api/ask', async (req, res) => {
       .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }))
       .slice(-20);
     if (!msgs.length || msgs[msgs.length - 1].role !== 'user') return res.status(400).json({ error: 'Need a question to answer.' });
+    const capAsk = await bumpUsage('ask');
+    if (!capAsk.allowed) return res.status(429).json({ error: 'Daily chat allowance reached (' + capAsk.used + '/' + capAsk.cap + '). It resets at midnight UTC.' });
     const context = typeof body.context === 'string' ? body.context.slice(0, 10000) : '';
     const system = CHAT_SYS + (context ? '\n\n=== LIVE SNAPSHOT (his command centre, right now) ===\n' + context : '\n\n(No live snapshot was provided this turn.)');
     const reply = useAnthropic ? await callAnthropicChat(msgs, system, CHAT_MODEL) : await callGeminiChat(msgs, system, CHAT_MODEL);
     if (!reply) return res.status(502).json({ error: 'The assistant returned an empty response \u2014 try again.' });
     res.json({ reply, model: CHAT_MODEL });
   } catch (e) {
-    res.status(502).json({ error: String((e && e.message) || e).slice(0, 200) });
+    logUpstream('ask', e);
+    res.status(502).json({ error: shortReason(String((e && e.message) || e)) });
   }
 });
 const PROMPT_FILES = ['system-investing.md', 'deep-triggers.md', 'ai-roles.json'];
 app.get('/api/prompts', (req, res) => {
-  const out = {};
-  PROMPT_FILES.forEach(f => out[f] = loadPrompt(f));
-  res.json({ dir: PROMPT_DIR, files: PROMPT_FILES, prompts: out, ts: Date.now() });
+  /* `dir: PROMPT_DIR` REMOVED (step 3) — it leaked the absolute server path.
+   * `sources` ADDED (step 7): the frontend's "Prompt files" light previously went GREEN
+   * whenever this endpoint responded, because it only counted filenames. It could not
+   * distinguish a built-in default from a file override, so it asserted an integrity it
+   * had never checked. Now the backend says which each one is and the light can mean
+   * something. loadPrompt() precedence is unchanged — a file still wins. */
+  const out = {}, sources = {};
+  PROMPT_FILES.forEach(f => { out[f] = loadPrompt(f); sources[f] = _psource[f] || 'default'; });
+  res.json({ files: PROMPT_FILES, prompts: out, sources, overrides: PROMPT_FILES.filter(f => sources[f] === 'file'), ts: Date.now() });
 });
 /* POST /api/prompts REMOVED (step 2, owner ruling).
  * It was an unauthenticated remote write into the committee's own instructions and had no
@@ -1196,6 +1287,49 @@ async function sbRead(type, limit) {
   if (!r.ok) throw new Error('supabase read ' + r.status);
   const rows = await r.json();
   return rows.reverse();   // return oldest-first to match the file store
+}
+
+
+/* ── DURABLE DAILY USAGE CAP (step 5) ───────────────────────────────────────────
+ * Bounds what a STOLEN TOKEN or a runaway client can spend. Authentication is what
+ * stops anonymous quota drain; this is the second line behind it.
+ *
+ * ATOMICITY IS THE WHOLE POINT. Do NOT reimplement this as
+ *      read count -> count + 1 -> write it back
+ * in JavaScript. Two simultaneous requests would both read 7, both conclude 8 is
+ * within the cap, and both proceed — the limit fails exactly when parallel requests
+ * arrive, which is the only case it exists for. This file is already parallel by
+ * nature (Promise.allSettled in the committee rounds, Promise.all in prices).
+ * The increment and the check therefore happen in ONE statement inside Postgres;
+ * Node sends one call and receives an allowed/denied answer.
+ *
+ * Requires the SQL in supabase-usage-cap.sql to have been applied.
+ *
+ * FAILS OPEN, deliberately. If Supabase is unreachable or the function is missing,
+ * the request proceeds and the reason is logged. That is correct HERE and only here:
+ * the caller has already passed authentication, so refusing would lock the owner out
+ * of his own dashboard for no security gain. Auth fails closed; this does not.       */
+const DAILY_CAPS = {
+  'deep-triggers': Math.max(1, +process.env.CAP_DEEP_TRIGGERS || 60),
+  'ask':           Math.max(1, +process.env.CAP_ASK || 250)
+};
+async function bumpUsage(endpoint) {
+  const cap = DAILY_CAPS[endpoint];
+  if (!cap || !sbOn()) return { allowed: true, skipped: 'no_store' };
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/rpc/bump_usage`, {
+      method: 'POST', headers: sbHeaders(true),
+      body: JSON.stringify({ p_endpoint: endpoint, p_limit: cap })
+    });
+    if (!r.ok) throw new Error('rpc ' + r.status + ' ' + (await r.text()).slice(0, 120));
+    const rows = await r.json();
+    const row = Array.isArray(rows) ? rows[0] : rows;
+    if (!row || typeof row.allowed !== 'boolean') throw new Error('unexpected rpc shape');
+    return row;
+  } catch (e) {
+    logUpstream('usage-cap:' + endpoint, e);
+    return { allowed: true, skipped: 'unavailable' };
+  }
 }
 
 app.get('/api/history', async (req, res) => {
