@@ -1013,7 +1013,7 @@ app.post('/api/deep-triggers', async (req, res) => {
         sbRead('journal', 8).catch(() => [])
       ]);
       MEMORY = buildMemory(runs, journal);
-    } catch (_) { /* no memory this run */ }
+    } catch (e) { logUpstream('memory:read', e); /* no memory this run */ }
   }
   const SYSTEM = loadPrompt('system-investing.md') + VERDICT_GUIDE + (MEMORY ? '\n\n' + MEMORY : '');
 
@@ -1163,7 +1163,7 @@ app.post('/api/deep-triggers', async (req, res) => {
         idiotGuide: out.idiotGuide, synthesised: out.synthesised, synthBy: out.synthBy, geoRisk: out.geoRisk
       },
       packet
-    }]).catch(() => {});
+    }]).catch(e => logUpstream('committee_runs:write', e));
   }
 });
 
@@ -1342,7 +1342,7 @@ app.get('/api/history', async (req, res) => {
       if (type === 'committee_runs') return res.json({ committee_runs: await sbRead('committee_runs', limit), backend: 'supabase', ts: Date.now() });
       const [snapshots, journal] = await Promise.all([sbRead('snapshots', limit), sbRead('journal', limit)]);
       return res.json({ snapshots, journal, backend: 'supabase', ts: Date.now() });
-    } catch (e) { /* fall through to file store */ }
+    } catch (e) { logUpstream('history:read', e); /* fall through to file store */ }
   }
   const h = histLoad();
   if (type === 'snapshots') return res.json({ snapshots: h.snapshots.slice(-limit), backend: 'file', ts: Date.now() });
@@ -1356,7 +1356,7 @@ app.post('/api/history', async (req, res) => {
   if (!incoming.length) return res.status(400).json({ error: 'no entry/entries provided' });
   if (sbOn()) {
     try { await sbAppend(type, incoming); return res.json({ ok: true, type, count: incoming.length, backend: 'supabase', ts: Date.now() }); }
-    catch (e) { /* fall back to file store below, never crash */ }
+    catch (e) { logUpstream('history:write', e); /* fall back to file store below, never crash */ }
   }
   const h = histLoad();
   if (type === 'journal') { incoming.forEach(e => { const i = h.journal.findIndex(x => x.id === e.id); if (i >= 0) h.journal[i] = e; else h.journal.push(e); }); h.journal = h.journal.slice(-500); }
